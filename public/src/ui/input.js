@@ -1,0 +1,475 @@
+// Mouse + keyboard: selection, contextual orders, building placement, hotkeys,
+// control groups and camera control.
+
+import { BUILD_MENU } from '../data/buildings.js';
+
+const EDGE = 18;          // screen-edge pan margin in px
+const PAN_SPEED = 24;     // tiles per second at zoom 22
+
+export class Input {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.game = ctx.game;
+    this.renderer = ctx.renderer;
+    this.playerIndex = ctx.playerIndex;
+    this.player = this.game.players[this.playerIndex];
+
+    this.selection = [];
+    this.controlGroups = new Map();
+    this.cursorMode = null;
+    this.placement = null;
+    this.dragStart = null;
+    this.dragNow = null;
+    this.mouse = { x: 0, y: 0, inWindow: true };
+    this.keys = new Set();
+    this.idleVillagerIdx = 0;
+    this.idleMilitaryIdx = 0;
+    this.lastClickTime = 0;
+    this.lastClickEntity = null;
+
+    this.boxEl = document.getElementById('selbox');
+    this.canvas = ctx.canvas;
+    this._bind();
+  }
+
+  get hud() { return this.ctx.hud; }
+
+  _bind() {
+    const c = this.canvas;
+    c.addEventListener('contextmenu', (e) => e.preventDefault());
+    c.addEventListener('mousedown', (e) => this._onMouseDown(e));
+    window.addEventListener('mouseup', (e) => this._onMouseUp(e));
+    window.addEventListener('mousemove', (e) => this._onMouseMove(e));
+    c.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      this.renderer.setZoom(this.renderer.zoom * (e.deltaY > 0 ? 1.12 : 0.89));
+    }, { passive: false });
+    window.addEventListener('keydown', (e) => this._onKeyDown(e));
+    window.addEventListener('keyup', (e) => this.keys.delete(e.code));
+    window.addEventListener('blur', () => this.keys.clear());
+    document.addEventListener('mouseleave', () => { this.mouse.inWindow = false; });
+    document.addEventListener('mouseenter', () => { this.mouse.inWindow = true; });
+  }
+
+  /* ================================================================
+   *  Mouse
+   * ================================================================ */
+
+  _onMouseDown(e) {
+    if (this.hud?.modalOpen) return;
+    const pt = { x: e.clientX, y: e.clientY };
+    if (e.button === 0) {
+      if (this.placement) { this._placeBuilding(e.shiftKey); return; }
+      if (this.cursorMode) { this._applyCursorMode(pt, e.shiftKey); return; }
+      this.dragStart = pt;
+      this.dragNow = pt;
+    } else if (e.button === 2) {
+      if (this.placement) { this.cancelPlacement(); return; }
+      if (this.cursorMode) { this.cursorMode = null; document.body.style.cursor = ''; return; }
+      this._rightClick(pt, e.shiftKey);
+    } else if (e.button === 1) {
+      this.middlePan = pt;
+    }
+  }
+
+  _onMouseMove(e) {
+    this.mouse.x = e.clientX;
+    this.mouse.y = e.clientY;
+    this.mouse.inWindow = true;
+    if (this.dragStart) {
+      this.dragNow = { x: e.clientX, y: e.clientY };
+      this._updateBox();
+    }
+    if (this.middlePan) {
+      const dx = e.clientX - this.middlePan.x;
+      const dy = e.clientY - this.middlePan.y;
+      this.middlePan = { x: e.clientX, y: e.clientY };
+      const k = this.renderer.zoom / 400;
+      this.renderer.panBy(-dx * k, -dy * k);
+    }
+    if (this.placement) this._updatePlacement();
+  }
+
+  _onMouseUp(e) {
+    if (e.button === 1) { this.middlePan = null; return; }
+    if (e.button !== 0 || !this.dragStart) return;
+    const a = this.dragStart, b = this.dragNow || this.dragStart;
+    this.dragStart = null;
+    this.boxEl.style.display = 'none';
+    const w = Math.abs(a.x - b.x), h = Math.abs(a.y - b.y);
+    if (w < 5 && h < 5) this._singleClick(a, e.shiftKey, e.detail >= 2 || this._isDoubleClick());
+    else this._boxSelect(a, b, e.shiftKey);
+  }
+
+  _isDoubleClick() {
+    const now = performance.now();
+    const dbl = now - this.lastClickTime < 320;
+    this.lastClickTime = now;
+    return dbl;
+  }
+
+  _updateBox() {
+    const a = this.dragStart, b = this.dragNow;
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    const w = Math.abs(a.x - b.x), h = Math.abs(a.y - b.y);
+    if (w < 4 && h < 4) { this.boxEl.style.display = 'none'; return; }
+    this.boxEl.style.display = 'block';
+    this.boxEl.style.left = x + 'px';
+    this.boxEl.style.top = y + 'px';
+    this.boxEl.style.width = w + 'px';
+    this.boxEl.style.height = h + 'px';
+  }
+
+  /* ---------------- picking ---------------- */
+
+  /** Screen-space pick: projects visible entities and takes the nearest. */
+  pickAt(sx, sy, maxDist = 34) {
+    const g = this.game;
+    let best = null, bestD = maxDist * maxDist, bestPri = -1;
+    for (const e of g.entities) {
+      if (!e.alive || e.kind === 'projectile' || e.garrisonedIn) continue;
+      const visible = g.revealAll ||
+        (e.kind === 'building' || e.kind === 'resource'
+          ? this.player.hasExplored(e.x | 0, e.y | 0)
+          : this.player.canSee(e.x | 0, e.y | 0));
+      if (!visible) continue;
+      const h = this.renderer.heightAt(e.x, e.y) + (e.kind === 'building' ? e.size * 0.35 : 0.4);
+      const p = this.renderer.worldToScreen(e.x, h, e.y);
+      if (p.z > 1 || p.z < -1) continue;
+      const dx = p.x - sx, dy = p.y - sy;
+      const d = dx * dx + dy * dy;
+      const pri = e.kind === 'unit' ? 3 : e.kind === 'building' ? 2 : 1;
+      const radiusPx = e.kind === 'building' ? e.size * 16 : 22;
+      if (d > radiusPx * radiusPx) continue;
+      if (pri > bestPri || (pri === bestPri && d < bestD)) {
+        best = e; bestD = d; bestPri = pri;
+      }
+    }
+    return best;
+  }
+
+  _singleClick(pt, additive, isDouble) {
+    const hit = this.pickAt(pt.x, pt.y);
+    if (!hit) { if (!additive) this.setSelection([]); return; }
+    if (isDouble && hit.kind === 'unit' && hit.owner === this.playerIndex) {
+      // select every visible unit of the same type
+      const same = [];
+      for (const e of this.game.entities) {
+        if (e.alive && e.kind === 'unit' && e.owner === this.playerIndex && e.type === hit.type) {
+          const p = this.renderer.worldToScreen(e.x, 0, e.y);
+          if (p.x > 0 && p.x < this.renderer.viewW && p.y > 0 && p.y < this.renderer.viewH) same.push(e);
+        }
+      }
+      this.setSelection(same);
+      return;
+    }
+    if (additive) {
+      if (this.selection.includes(hit)) this.setSelection(this.selection.filter((e) => e !== hit));
+      else this.setSelection([...this.selection, hit]);
+    } else {
+      this.setSelection([hit]);
+    }
+  }
+
+  _boxSelect(a, b, additive) {
+    const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x);
+    const y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y);
+    const found = [];
+    for (const e of this.game.entities) {
+      if (!e.alive || e.kind !== 'unit' || e.garrisonedIn) continue;
+      if (e.owner !== this.playerIndex) continue;
+      if (!this.game.revealAll && !this.player.canSee(e.x | 0, e.y | 0)) continue;
+      const p = this.renderer.worldToScreen(e.x, this.renderer.heightAt(e.x, e.y) + 0.4, e.y);
+      if (p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1) found.push(e);
+    }
+    // prefer military units when a box catches both soldiers and villagers
+    const military = found.filter((e) => e.def.cat !== 'villager' && e.def.cat !== 'trade');
+    const pick = military.length ? military : found;
+    this.setSelection(additive ? dedupe([...this.selection, ...pick]) : pick);
+  }
+
+  setSelection(list) {
+    for (const e of this.selection) e.selected = false;
+    this.selection = list.filter((e) => e && e.alive);
+    for (const e of this.selection) e.selected = true;
+    if (this.hud) this.hud.cardMode = 'default';
+  }
+
+  /* ---------------- orders ---------------- */
+
+  _rightClick(pt, shift) {
+    const mine = this.selection.filter((e) => e.owner === this.playerIndex);
+    if (!mine.length) return;
+    const units = mine.filter((e) => e.kind === 'unit');
+    const buildings = mine.filter((e) => e.kind === 'building');
+    const hit = this.pickAt(pt.x, pt.y);
+    const world = this.renderer.screenToWorld(pt.x, pt.y);
+
+    // right-clicking with a building selected sets its rally point
+    if (buildings.length && !units.length) {
+      for (const b of buildings) b.rally = hit && hit.kind === 'resource' ? { x: hit.x, y: hit.y } : world;
+      this.player.notify('Rally point set');
+      return;
+    }
+    if (!units.length) return;
+
+    if (hit && hit !== undefined) {
+      if (hit.kind === 'resource') {
+        if (hit.type === 'relic') { this.game.commandRelic(units, hit); return; }
+        const gatherers = units.filter((u) => u.def.cat === 'villager');
+        if (gatherers.length) { this.game.commandGather(gatherers, hit); }
+        const rest = units.filter((u) => u.def.cat !== 'villager');
+        if (rest.length && world) this.game.commandMove(rest, world.x, world.y);
+        return;
+      }
+      if (this.game.isEnemy(this.playerIndex, hit.owner) || hit.owner < 0) {
+        // hunting: villagers gather from huntable gaia animals
+        const vills = units.filter((u) => u.def.cat === 'villager');
+        if (hit.owner < 0 && hit.kind === 'unit' && hit.def.huntable && vills.length) {
+          this.game.commandGather(vills, hit);
+          const rest = units.filter((u) => u.def.cat !== 'villager');
+          if (rest.length) this.game.commandAttack(rest, hit);
+          return;
+        }
+        this.game.commandAttack(units, hit);
+        return;
+      }
+      if (hit.kind === 'building' && hit.owner === this.playerIndex) {
+        const vills = units.filter((u) => u.def.cat === 'villager');
+        const others = units.filter((u) => u.def.cat !== 'villager');
+        if (!hit.complete && vills.length) {
+          for (const v of vills) v.task = { type: 'build', targetId: hit.id };
+        } else if (vills.length && hit.hp < hit.maxHp) {
+          for (const v of vills) v.task = { type: 'repair', targetId: hit.id };
+        } else if (vills.length && hit.def.farmFood) {
+          this.game.commandGather(vills, { ...hit, kind: 'resource', resType: 'food', id: hit.id });
+        } else if (vills.length && hit.def.garrison) {
+          this.game.commandGarrison(vills, hit);
+        } else if (vills.length && world) {
+          this.game.commandMove(vills, world.x, world.y);
+        }
+        if (others.length) {
+          if (hit.def.garrison) this.game.commandGarrison(others, hit);
+          else if (world) this.game.commandMove(others, world.x, world.y);
+        }
+        return;
+      }
+      if (hit.kind === 'unit' && this.game.isAlly(this.playerIndex, hit.owner) && hit.owner !== this.playerIndex) {
+        const monks = units.filter((u) => u.def.converts);
+        if (monks.length) { this.game.commandHeal(monks, hit); return; }
+      }
+      if (hit.kind === 'unit' && hit.owner === this.playerIndex && hit.def.garrison) {
+        this.game.commandGarrison(units.filter((u) => u !== hit), hit);
+        return;
+      }
+    }
+    if (world) {
+      const monks = units.filter((u) => u.def.converts && u.hp < u.maxHp * 999);
+      void monks;
+      this.game.commandMove(units, world.x, world.y);
+      this.ctx.effects?.pushMoveMarker(world.x, world.y);
+    }
+    void shift;
+  }
+
+  setCursorMode(mode) {
+    this.cursorMode = mode;
+    document.body.style.cursor = 'crosshair';
+  }
+
+  _applyCursorMode(pt, shift) {
+    const mode = this.cursorMode;
+    this.cursorMode = null;
+    document.body.style.cursor = '';
+    const units = this.selection.filter((e) => e.owner === this.playerIndex && e.kind === 'unit');
+    const buildings = this.selection.filter((e) => e.owner === this.playerIndex && e.kind === 'building');
+    const world = this.renderer.screenToWorld(pt.x, pt.y);
+    const hit = this.pickAt(pt.x, pt.y);
+    switch (mode) {
+      case 'move': if (world) this.game.commandMove(units, world.x, world.y); break;
+      case 'attackMove':
+        if (hit && this.game.isEnemy(this.playerIndex, hit.owner)) this.game.commandAttack(units, hit);
+        else if (world) this.game.commandAttackMove(units, world.x, world.y);
+        break;
+      case 'garrison': if (hit && hit.owner === this.playerIndex) this.game.commandGarrison(units, hit); break;
+      case 'repair': if (hit && hit.kind === 'building') {
+        for (const u of units) if (u.def.cat === 'villager') u.task = { type: 'repair', targetId: hit.id };
+      } break;
+      case 'heal': if (hit) this.game.commandHeal(units, hit); break;
+      case 'relic': if (hit && hit.type === 'relic') this.game.commandRelic(units, hit); break;
+      case 'trade': if (hit && hit.type === 'market') this.game.commandTrade(units, hit); break;
+      case 'rally': if (world) for (const b of buildings) b.rally = world; break;
+      default: break;
+    }
+    void shift;
+  }
+
+  /* ---------------- building placement ---------------- */
+
+  startPlacement(bId) {
+    if (!this.player.isBuildingAvailable(bId)) return;
+    this.placement = { id: bId, tx: 0, ty: 0, size: this.player.mods.building(bId).size, valid: false };
+    this._updatePlacement();
+  }
+
+  cancelPlacement() {
+    this.placement = null;
+    this.renderer.placement = null;
+  }
+
+  _updatePlacement() {
+    if (!this.placement) return;
+    const w = this.renderer.screenToWorld(this.mouse.x, this.mouse.y);
+    if (!w) return;
+    const size = this.placement.size;
+    const tx = Math.round(w.x - size / 2);
+    const ty = Math.round(w.y - size / 2);
+    this.placement.tx = tx;
+    this.placement.ty = ty;
+    this.placement.valid = this.game.canPlaceBuilding(this.placement.id, this.playerIndex, tx, ty) &&
+      this.player.canAfford(this.player.mods.building(this.placement.id).cost);
+    this.renderer.placement = this.placement;
+  }
+
+  _placeBuilding(keepPlacing) {
+    const p = this.placement;
+    if (!p || !p.valid) return;
+    const villagers = this.selection.filter((e) =>
+      e.owner === this.playerIndex && e.kind === 'unit' && e.def.cat === 'villager');
+    const builders = villagers.length ? villagers : this._nearestIdleVillagers(p.tx, p.ty, 2);
+    if (!builders.length) { this.player.notify('Select a villager first'); return; }
+    this.game.commandBuild(builders, p.id, p.tx, p.ty);
+    if (!keepPlacing) this.cancelPlacement();
+    else this._updatePlacement();
+  }
+
+  _nearestIdleVillagers(tx, ty, n) {
+    const list = this.game.entities.filter((e) =>
+      e.alive && e.kind === 'unit' && e.owner === this.playerIndex && e.def.cat === 'villager');
+    list.sort((a, b) => Math.hypot(a.x - tx, a.y - ty) - Math.hypot(b.x - tx, b.y - ty));
+    return list.slice(0, n);
+  }
+
+  /* ================================================================
+   *  Keyboard
+   * ================================================================ */
+
+  _onKeyDown(e) {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
+    this.keys.add(e.code);
+    const mine = this.selection.filter((x) => x.owner === this.playerIndex);
+    const units = mine.filter((x) => x.kind === 'unit');
+
+    // control groups
+    if (e.code.startsWith('Digit')) {
+      const n = e.code.slice(5);
+      if (n >= '1' && n <= '9') {
+        if (e.ctrlKey) { this.controlGroups.set(n, [...mine]); this.player.notify('Control group ' + n + ' set'); }
+        else {
+          const grp = (this.controlGroups.get(n) || []).filter((x) => x.alive);
+          if (grp.length) {
+            this.setSelection(grp);
+            if (this._lastGroupKey === n && performance.now() - (this._lastGroupTime || 0) < 400) {
+              this.renderer.centerOn(grp[0].x, grp[0].y);
+            }
+            this._lastGroupKey = n;
+            this._lastGroupTime = performance.now();
+          }
+        }
+        e.preventDefault();
+        return;
+      }
+    }
+
+    switch (e.code) {
+      case 'Escape':
+        if (this.hud?.modalOpen) this.hud.hideModal();
+        else if (this.placement) this.cancelPlacement();
+        else if (this.cursorMode) { this.cursorMode = null; document.body.style.cursor = ''; }
+        else if (this.hud) { this.hud.cardMode = 'default'; this.hud._cardKey = ''; }
+        break;
+      case 'KeyA': if (units.length) this.setCursorMode('attackMove'); break;
+      case 'KeyS': if (units.length) this.game.commandStop(units); break;
+      case 'KeyG': if (units.length) this.setCursorMode('garrison'); break;
+      case 'KeyB': if (this.hud) { this.hud.cardMode = 'buildEco'; this.hud._cardKey = ''; } break;
+      case 'KeyV': if (this.hud) { this.hud.cardMode = 'buildMil'; this.hud._cardKey = ''; } break;
+      case 'KeyH': this._selectTownCenter(); break;
+      case 'KeyQ': this.renderer.rotate(-1); break;
+      case 'KeyE': this.renderer.rotate(1); break;
+      case 'Period': this._cycleIdle('villager'); break;
+      case 'Comma': this._cycleIdle('military'); break;
+      case 'Delete': for (const u of mine) this.game.kill(u, null); this.setSelection([]); break;
+      case 'F3': e.preventDefault(); this.hud?.toggleTechTree(); break;
+      case 'F1': e.preventDefault(); this.hud?.toggleHelp(); break;
+      case 'F10': e.preventDefault(); this.hud?.toggleMenu(); break;
+      case 'Space': {
+        e.preventDefault();
+        if (this.selection.length) this.renderer.centerOn(this.selection[0].x, this.selection[0].y);
+        break;
+      }
+      default: break;
+    }
+
+    // quick build hotkeys while a build page is open
+    if (this.hud && (this.hud.cardMode === 'buildEco' || this.hud.cardMode === 'buildMil')) {
+      const quick = { KeyH: 'house', KeyM: 'mill', KeyL: 'lumberCamp', KeyC: 'miningCamp',
+        KeyF: 'farm', KeyR: 'barracks', KeyT: 'watchTower' };
+      const id = quick[e.code];
+      if (id && (BUILD_MENU[this.player.age] || []).includes(id)) this.startPlacement(id);
+    }
+  }
+
+  _selectTownCenter() {
+    const tcs = this.game.entities.filter((e) =>
+      e.alive && e.kind === 'building' && e.owner === this.playerIndex && e.type === 'townCenter');
+    if (!tcs.length) return;
+    this._tcIdx = ((this._tcIdx ?? -1) + 1) % tcs.length;
+    const tc = tcs[this._tcIdx];
+    this.setSelection([tc]);
+    this.renderer.centerOn(tc.x, tc.y);
+  }
+
+  _cycleIdle(kind) {
+    const list = this.game.entities.filter((e) => {
+      if (!e.alive || e.kind !== 'unit' || e.owner !== this.playerIndex) return false;
+      if (e.task.type !== 'idle' || e.garrisonedIn) return false;
+      return kind === 'villager' ? e.def.cat === 'villager' : (e.def.cat !== 'villager' && e.def.cat !== 'trade');
+    });
+    if (!list.length) { this.player.notify(`No idle ${kind}`); return; }
+    const idxKey = kind === 'villager' ? 'idleVillagerIdx' : 'idleMilitaryIdx';
+    this[idxKey] = this[idxKey] % list.length;
+    const u = list[this[idxKey]++];
+    this.setSelection([u]);
+    this.renderer.centerOn(u.x, u.y);
+  }
+
+  /* ---------------- per-frame camera ---------------- */
+
+  updateCamera(dt) {
+    if (this.hud?.modalOpen) return;
+    let dx = 0, dy = 0;
+    if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) dy -= 1;
+    if (this.keys.has('KeyS') && !this.selection.length) dy += 1;
+    if (this.keys.has('ArrowDown')) dy += 1;
+    if (this.keys.has('KeyA') && !this.selection.length) dx -= 1;
+    if (this.keys.has('ArrowLeft')) dx -= 1;
+    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) dx += 1;
+
+    if (this.mouse.inWindow && !this.middlePan) {
+      if (this.mouse.x < EDGE) dx -= 1;
+      if (this.mouse.x > window.innerWidth - EDGE) dx += 1;
+      if (this.mouse.y < EDGE) dy -= 1;
+      if (this.mouse.y > window.innerHeight - EDGE) dy += 1;
+    }
+    if (dx || dy) {
+      const k = PAN_SPEED * dt * (this.renderer.zoom / 22);
+      this.renderer.panBy(dx * k, dy * k);
+    }
+    // prune dead entities from the selection
+    if (this.selection.some((e) => !e.alive)) {
+      this.selection = this.selection.filter((e) => e.alive);
+    }
+  }
+}
+
+function dedupe(a) { return [...new Set(a)]; }

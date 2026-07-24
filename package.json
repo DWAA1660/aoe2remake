@@ -1,0 +1,16 @@
+{
+  "name": "aoe2remake",
+  "version": "1.0.0",
+  "description": "Age of Antiquity - a retro low-poly 3D/2D-hybrid remake of Age of Empires II: Definitive Edition",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "fetch-assets": "node scripts/fetch-assets.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "private": true
+}
