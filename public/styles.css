@@ -63,6 +63,20 @@ img.pix { image-rendering: pixelated; display: block; }
   background: rgba(0,0,0,0.32); border: 1px solid #514230; border-radius: 3px;
 }
 .resval { font-weight: bold; min-width: 42px; font-variant-numeric: tabular-nums; }
+.resworkers {
+  font-size: 10px; color: var(--dim); min-width: 14px; text-align: right;
+  font-variant-numeric: tabular-nums; margin-left: -4px;
+}
+.idlebox { cursor: pointer; }
+.idlebox:hover { border-color: var(--gold); }
+.idlebox .resval { min-width: 22px; }
+.idlebox.has-idle .resval { color: #ffcf6a; }
+.idlebox.has-idle { border-color: #8a6f45; }
+
+.sel-carry-row { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 11px; }
+.carrytext { min-width: 96px; }
+.carrybar { flex: 1; max-width: 90px; height: 7px; background: #241d14; border: 1px solid #000; }
+.carryfill { height: 100%; }
 .agebox {
   margin-left: 10px; padding: 3px 12px; background: rgba(0,0,0,0.35);
   border: 1px solid var(--edge2); border-radius: 3px; color: var(--gold); font-weight: bold;

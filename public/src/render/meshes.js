@@ -10,6 +10,13 @@ const PALETTE = {
   black: 0x232329, fur: 0xb99a72, furDark: 0x6a4f36, red: 0xa33028, water: 0x2d6a8f,
 };
 
+// sRGB byte -> linear float, precomputed once (see MeshBuilder._color).
+const SRGB_TO_LINEAR = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const c = i / 255;
+  SRGB_TO_LINEAR[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
 /** Accumulates boxes/prisms then bakes them into one geometry. */
 class MeshBuilder {
   constructor() { this.pos = []; this.norm = []; this.col = []; }
@@ -106,9 +113,13 @@ class MeshBuilder {
   }
 
   _color(out, hex, mul) {
-    out[0] = Math.min(1, ((hex >> 16) & 255) / 255 * mul);
-    out[1] = Math.min(1, ((hex >> 8) & 255) / 255 * mul);
-    out[2] = Math.min(1, (hex & 255) / 255 * mul);
+    // Palette entries are sRGB hex, but vertex colours are consumed in the
+    // renderer's linear working space (the terrain gets this for free via
+    // Color.setHex). Converting here keeps units, buildings and ground on one
+    // consistent scale; skipping it makes models read washed-out next to terrain.
+    out[0] = Math.min(1, SRGB_TO_LINEAR[(hex >> 16) & 255] * mul);
+    out[1] = Math.min(1, SRGB_TO_LINEAR[(hex >> 8) & 255] * mul);
+    out[2] = Math.min(1, SRGB_TO_LINEAR[hex & 255] * mul);
   }
 
   build(THREE) {
@@ -140,9 +151,59 @@ function bipedBase(m, teamColor = TEAM) {
 const UNIT_BUILDERS = {
   villager(m) {
     bipedBase(m);
-    m.box(0.22, 0.06, 0.22, 0, 0.76, 0, PALETTE.straw);       // hat
-    m.box(0.05, 0.30, 0.05, 0.18, 0.45, 0.06, PALETTE.wood);  // tool handle
-    m.box(0.10, 0.08, 0.04, 0.18, 0.60, 0.06, PALETTE.steel);
+    m.box(0.24, 0.06, 0.24, 0, 0.77, 0, PALETTE.straw);       // wide-brim hat
+    m.box(0.13, 0.06, 0.13, 0, 0.81, 0, PALETTE.straw);       // crown
+    m.box(0.07, 0.20, 0.07, -0.19, 0.44, 0.02, PALETTE.skin); // arms
+    m.box(0.07, 0.20, 0.07, 0.19, 0.44, 0.02, PALETTE.skin);
+    m.box(0.05, 0.34, 0.05, 0.21, 0.48, 0.07, PALETTE.wood);  // shouldered tool
+    m.box(0.11, 0.09, 0.05, 0.21, 0.66, 0.07, PALETTE.steel);
+  },
+  // Crouched over the ground: foraging berries, mining, farming.
+  villagerKneel(m) {
+    m.box(0.30, 0.28, 0.24, 0, 0.30, 0.04, TEAM);             // torso, pitched forward
+    m.box(0.12, 0.12, 0.26, -0.10, 0.08, -0.04, PALETTE.dark); // folded legs
+    m.box(0.12, 0.12, 0.26, 0.10, 0.08, -0.04, PALETTE.dark);
+    m.box(0.19, 0.17, 0.17, 0, 0.48, 0.16, PALETTE.skin);     // head, looking down
+    m.box(0.23, 0.06, 0.23, 0, 0.55, 0.16, PALETTE.straw);    // hat
+    m.box(0.06, 0.18, 0.06, -0.16, 0.26, 0.18, PALETTE.skin); // arms reaching down
+    m.box(0.06, 0.18, 0.06, 0.16, 0.26, 0.18, PALETTE.skin);
+    m.box(0.14, 0.05, 0.05, 0.16, 0.16, 0.24, PALETTE.steel); // hand tool on the ground
+  },
+  // Hauling a full load back to a drop site: bent under a shoulder sack.
+  villagerHaul(m) {
+    m.box(0.30, 0.32, 0.21, 0, 0.40, 0.02, TEAM);
+    m.box(0.10, 0.22, 0.10, -0.11, 0.15, 0.02, PALETTE.dark);
+    m.box(0.10, 0.22, 0.10, 0.11, 0.15, 0.02, PALETTE.dark);
+    m.box(0.20, 0.18, 0.18, 0, 0.65, 0.04, PALETTE.skin);
+    m.box(0.24, 0.06, 0.24, 0, 0.73, 0.04, PALETTE.straw);
+    m.box(0.26, 0.24, 0.22, 0, 0.62, -0.20, PALETTE.wood2);  // sack on the back
+    m.box(0.10, 0.08, 0.08, 0, 0.76, -0.20, PALETTE.straw);  // tied neck
+    m.box(0.06, 0.20, 0.06, -0.17, 0.50, -0.06, PALETTE.skin);
+    m.box(0.06, 0.20, 0.06, 0.17, 0.50, -0.06, PALETTE.skin);
+  },
+  // Building or repairing: hammer raised over a work trestle.
+  villagerBuild(m) {
+    m.box(0.30, 0.32, 0.21, 0, 0.40, 0.02, TEAM);
+    m.box(0.10, 0.24, 0.10, -0.11, 0.16, -0.02, PALETTE.dark);
+    m.box(0.10, 0.24, 0.10, 0.11, 0.16, 0.04, PALETTE.dark);
+    m.box(0.20, 0.18, 0.18, 0, 0.66, 0.05, PALETTE.skin);
+    m.box(0.24, 0.06, 0.24, 0, 0.74, 0.05, PALETTE.straw);
+    m.box(0.07, 0.26, 0.07, 0.18, 0.62, 0.08, PALETTE.skin);  // raised arm
+    m.box(0.05, 0.26, 0.05, 0.20, 0.84, 0.10, PALETTE.wood);  // hammer haft
+    m.box(0.16, 0.11, 0.11, 0.20, 1.00, 0.10, PALETTE.steelDark); // hammer head
+    m.box(0.06, 0.16, 0.06, -0.17, 0.46, 0.10, PALETTE.skin);
+  },
+  // Mid-swing with an axe: woodcutting.
+  villagerChop(m) {
+    m.box(0.30, 0.32, 0.21, 0, 0.40, 0.03, TEAM);             // torso leaning in
+    m.box(0.10, 0.24, 0.10, -0.11, 0.16, -0.03, PALETTE.dark);
+    m.box(0.10, 0.24, 0.10, 0.11, 0.16, 0.05, PALETTE.dark);
+    m.box(0.20, 0.18, 0.18, 0, 0.66, 0.08, PALETTE.skin);
+    m.box(0.24, 0.06, 0.24, 0, 0.74, 0.08, PALETTE.straw);
+    m.box(0.07, 0.22, 0.07, 0.17, 0.50, 0.16, PALETTE.skin);  // both arms forward
+    m.box(0.07, 0.22, 0.07, -0.13, 0.50, 0.16, PALETTE.skin);
+    m.box(0.05, 0.05, 0.40, 0.04, 0.46, 0.32, PALETTE.wood);  // axe haft, angled down
+    m.box(0.14, 0.10, 0.08, 0.04, 0.36, 0.50, PALETTE.steel); // axe head at the cut
   },
   infantry(m) {
     bipedBase(m);
@@ -372,13 +433,19 @@ const BUILDING_BUILDERS = {
     m.box(0.20, 0.20, 0.20, -s * 0.24, 0.42, s * 0.20, PALETTE.gold);
     m.box(0.18, 0.18, 0.18, s * 0.20, 0.40, -s * 0.18, PALETTE.stone);
   },
+  // Deliberately low: a villager works standing in the middle of the plot, so
+  // tall crops or a tall fence would hide them.
   farm(m, s) {
-    m.box(s * 0.94, 0.06, s * 0.94, 0, 0.03, 0, PALETTE.dirt);
+    m.box(s * 0.94, 0.05, s * 0.94, 0, 0.025, 0, PALETTE.dirt);
+    // shallow ploughed furrows alternating with low crop rows
     for (let i = -2; i <= 2; i++) {
-      m.box(s * 0.88, 0.10, 0.16, 0, 0.10, i * s * 0.18, PALETTE.leafDry);
+      m.box(s * 0.88, 0.03, 0.09, 0, 0.055, i * s * 0.18 - 0.06, 0x6a5334);
+      m.box(s * 0.88, 0.05, 0.13, 0, 0.07, i * s * 0.18 + 0.05, PALETTE.straw);
+      m.box(s * 0.88, 0.03, 0.11, 0, 0.10, i * s * 0.18 + 0.05, 0xd8c260);
     }
+    // low corner markers, no full fence
     for (const [dx, dz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
-      m.box(0.08, 0.24, 0.08, dx * s * 0.46, 0.12, dz * s * 0.46, PALETTE.wood2);
+      m.box(0.07, 0.13, 0.07, dx * s * 0.47, 0.065, dz * s * 0.47, PALETTE.wood2);
     }
   },
   barracks(m, s) {
@@ -606,13 +673,78 @@ const RESOURCE_BUILDERS = {
 };
 
 /* ------------------------------------------------------------------ *
+ *  Construction sites and ground decoration
+ * ------------------------------------------------------------------ */
+
+const MISC_BUILDERS = {
+  // Built at unit footprint; the renderer scales it by the building's tile size.
+  foundation(m) {
+    m.box(0.97, 0.09, 0.97, 0, 0.045, 0, PALETTE.dirt);          // levelled ground
+    m.box(0.88, 0.05, 0.88, 0, 0.11, 0, 0x6a5a3f);               // packed earth
+    // surveyor's stakes at each corner, joined by string
+    for (const [dx, dz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      m.box(0.06, 0.36, 0.06, dx * 0.45, 0.18, dz * 0.45, PALETTE.wood);
+    }
+    m.box(0.94, 0.025, 0.035, 0, 0.33, -0.45, PALETTE.straw);
+    m.box(0.94, 0.025, 0.035, 0, 0.33, 0.45, PALETTE.straw);
+    m.box(0.035, 0.025, 0.94, -0.45, 0.33, 0, PALETTE.straw);
+    m.box(0.035, 0.025, 0.94, 0.45, 0.33, 0, PALETTE.straw);
+    // materials stacked on site
+    m.box(0.28, 0.07, 0.11, -0.24, 0.155, 0.22, PALETTE.wood2);
+    m.box(0.28, 0.07, 0.11, -0.24, 0.225, 0.22, PALETTE.wood);
+    m.box(0.13, 0.11, 0.13, 0.26, 0.17, -0.20, PALETTE.stone);
+    m.box(0.09, 0.08, 0.09, 0.16, 0.15, -0.28, PALETTE.stoneDark);
+  },
+  scaffold(m) {
+    for (const [dx, dz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      m.box(0.05, 1.0, 0.05, dx * 0.5, 0.5, dz * 0.5, PALETTE.wood);
+    }
+    m.box(1.04, 0.04, 0.05, 0, 0.55, -0.5, PALETTE.wood2);
+    m.box(1.04, 0.04, 0.05, 0, 0.55, 0.5, PALETTE.wood2);
+    m.box(0.05, 0.04, 1.04, -0.5, 0.8, 0, PALETTE.wood2);
+    m.box(0.05, 0.04, 1.04, 0.5, 0.8, 0, PALETTE.wood2);
+  },
+  // Floating "needs a worker" marker, hovered over an unworked farm.
+  idleMarker(m) {
+    m.box(0.07, 0.34, 0.07, 0, 0.17, 0, 0xe8c04a);
+    m.pyramid(0.30, 0.20, 0.30, 0, 0.34, 0, 0xf0d060);
+    m.pyramid(0.30, 0.20, 0.30, 0, 0.34, 0, 0xf0d060);
+    m.box(0.12, 0.12, 0.12, 0, 0.06, 0, 0xe8c04a);
+  },
+  grassTuft(m) {
+    m.box(0.05, 0.20, 0.05, -0.06, 0.10, 0.02, PALETTE.leaf);
+    m.box(0.05, 0.26, 0.05, 0.01, 0.13, -0.04, PALETTE.leaf2);
+    m.box(0.05, 0.17, 0.05, 0.07, 0.085, 0.05, PALETTE.leaf);
+  },
+  flowers(m) {
+    m.box(0.04, 0.16, 0.04, -0.05, 0.08, 0, PALETTE.leaf2);
+    m.box(0.08, 0.06, 0.08, -0.05, 0.18, 0, 0xd8d05a);
+    m.box(0.04, 0.13, 0.04, 0.06, 0.065, 0.04, PALETTE.leaf2);
+    m.box(0.07, 0.06, 0.07, 0.06, 0.155, 0.04, 0xd05a7a);
+  },
+  rock(m) {
+    m.box(0.26, 0.14, 0.22, 0, 0.07, 0, PALETTE.stone);
+    m.box(0.15, 0.11, 0.13, 0.08, 0.17, -0.03, PALETTE.stoneDark);
+  },
+  stump(m) {
+    m.box(0.22, 0.16, 0.22, 0, 0.08, 0, PALETTE.wood2);
+    m.box(0.17, 0.04, 0.17, 0, 0.18, 0, 0xa07040);
+  },
+};
+
+/* ------------------------------------------------------------------ *
  *  Public API
  * ------------------------------------------------------------------ */
 
 export const TEAM_COLOR_SENTINEL = TEAM;
 
 export function buildAllGeometries(THREE) {
-  const out = { units: {}, buildings: {}, resources: {} };
+  const out = { units: {}, buildings: {}, resources: {}, misc: {} };
+  for (const k in MISC_BUILDERS) {
+    const m = new MeshBuilder();
+    MISC_BUILDERS[k](m);
+    out.misc[k] = m.build(THREE);
+  }
   for (const k in UNIT_BUILDERS) {
     const m = new MeshBuilder();
     UNIT_BUILDERS[k](m);
@@ -663,4 +795,28 @@ export function unitMeshKey(def) {
 
 export function buildingMeshKey(type) {
   return BUILDING_BUILDERS[type] ? type : 'house';
+}
+
+/**
+ * Picks the mesh for a live entity, letting villagers swap to a working pose.
+ * Because instances are pooled per mesh key, changing the key is all it takes to
+ * re-pose a unit — no per-instance skinning required.
+ */
+export function unitMeshKeyFor(e) {
+  const base = unitMeshKey(e.def);
+  if (base !== 'villager') return base;
+  const t = e.task ? e.task.type : 'idle';
+
+  // Hauling reads at a glance even while walking, so it wins over the walk pose.
+  if (t === 'deliver' && e.carrying && e.carrying.amount > 0.5) return 'villagerHaul';
+  if (e.moving) return 'villager';
+  if (t === 'build' || t === 'repair') return 'villagerBuild';
+  if (t === 'gather') {
+    const sub = e.carrying ? e.carrying.sub : null;
+    // wood is chopped standing; farms, bushes and mines are worked crouched
+    if (sub === 'wood') return 'villagerChop';
+    if (sub === 'hunt') return 'villagerChop';
+    return 'villagerKneel';
+  }
+  return 'villager';
 }

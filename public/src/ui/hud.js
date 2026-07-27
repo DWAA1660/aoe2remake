@@ -10,6 +10,12 @@ import { PLAYER_COLORS } from '../render/renderer.js';
 import { ARMOR_CLASSES } from '../data/armor.js';
 import { UNITS } from '../data/units.js';
 import { CIVILIZATIONS } from '../data/civs.js';
+import { RESOURCE_INFO } from '../sim/entity.js';
+
+const RESOURCE_ICONS = {
+  tree: 'wood', gold: 'goldRes', stone: 'stoneRes', berries: 'food',
+  fish: 'food', carcass: 'food', relic: 'relic', farm: 'farm',
+};
 
 const ECO_BUILDINGS = ['house', 'mill', 'lumberCamp', 'miningCamp', 'farm', 'dock', 'market',
   'townCenter', 'monastery', 'university', 'wonder', 'feitoria', 'caravanserai'];
@@ -37,15 +43,34 @@ export class HUD {
     /* ---- top resource bar ---- */
     this.topBar = el('div', 'topbar');
     this.resEls = {};
+    this.workerEls = {};
     for (const r of ['food', 'wood', 'gold', 'stone']) {
       const box = el('div', 'resbox');
       box.appendChild(imgIcon(resIcon(r), 20));
       const v = el('span', 'resval'); v.textContent = '0';
       box.appendChild(v);
+      // villagers currently assigned to this resource, as AoE2:DE shows
+      const w = el('span', 'resworkers'); w.textContent = '';
+      box.appendChild(w);
       this.resEls[r] = v;
+      this.workerEls[r] = w;
       this.topBar.appendChild(box);
-      this.tip(box, () => `<b>${cap(r)}</b><br>Stockpiled ${cap(r)}.`);
+      this.tip(box, () => `<b>${cap(r)}</b><br>Stockpiled ${cap(r)}.` +
+        `<br><span class="dim">Small number = villagers gathering it.</span>`);
     }
+
+    // idle villager counter - click to jump to the next one
+    this.idleBox = el('div', 'resbox idlebox');
+    this.idleBox.appendChild(imgIcon('villager', 20));
+    this.idleEl = el('span', 'resval'); this.idleEl.textContent = '0';
+    this.idleBox.appendChild(this.idleEl);
+    this.idleBox.onclick = (ev) => {
+      if (ev.shiftKey) this.ctx.input.selectAllIdle('villager');
+      else this.ctx.input._cycleIdle('villager');
+    };
+    this.topBar.appendChild(this.idleBox);
+    this.tip(this.idleBox, 'Idle villagers.<br><b>Click</b> select the next one <b>[.]</b>' +
+      '<br><b>Shift + click</b> select <i>every</i> idle villager, ready to be given a job');
     const popBox = el('div', 'resbox');
     popBox.appendChild(imgIcon('pop', 20));
     this.popEl = el('span', 'resval'); this.popEl.textContent = '0/0';
@@ -115,6 +140,12 @@ export class HUD {
     this.minimap.addEventListener('mousedown', (e) => this._minimapClick(e));
     this.minimap.addEventListener('mousemove', (e) => { if (e.buttons & 1) this._minimapClick(e); });
 
+    // tell the renderer how much of the canvas the HUD hides
+    const applyInsets = () => this.ctx.renderer.setViewportInsets(
+      this.topBar.offsetHeight, this.bottom.offsetHeight);
+    applyInsets();
+    window.addEventListener('resize', applyInsets);
+
     this.mmCtx = this.minimap.getContext('2d');
     this.mmTerrain = document.createElement('canvas');
     this.mmTerrain.width = this.game.size;
@@ -153,10 +184,31 @@ export class HUD {
     const t = Math.floor(this.game.time);
     this.timeEl.textContent = `${String((t / 60) | 0).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
 
+    this._frame = (this._frame || 0) + 1;
+    if (this._frame % 10 === 0) this._updateWorkerCounts();
+
     this._updateNotifications();
     this._updateSelection(selection);
     this._updateCard(selection);
     this._drawMinimap();
+  }
+
+  /** Villagers per resource + idle count, for the AoE2-style top bar. */
+  _updateWorkerCounts() {
+    const counts = { food: 0, wood: 0, gold: 0, stone: 0 };
+    let idle = 0;
+    for (const e of this.game.entities) {
+      if (!e.alive || e.kind !== 'unit' || e.owner !== this.playerIndex) continue;
+      if (e.def.cat !== 'villager' || e.garrisonedIn) continue;
+      const t = e.task;
+      if (t.type === 'idle') { idle++; continue; }
+      if ((t.type === 'gather' || t.type === 'deliver') && counts[t.resType] !== undefined) {
+        counts[t.resType]++;
+      }
+    }
+    for (const r in counts) this.workerEls[r].textContent = counts[r] ? String(counts[r]) : '';
+    this.idleEl.textContent = String(idle);
+    this.idleBox.classList.toggle('has-idle', idle > 0);
   }
 
   _updateNotifications() {
@@ -168,8 +220,20 @@ export class HUD {
   /* ---------------- selection panel ---------------- */
 
   _updateSelection(sel) {
-    const key = sel.map((e) => e.id + ':' + Math.round(e.hp) + ':' + (e.queue ? e.queue.length : 0) +
-      ':' + (e.task ? e.task.type : '')).join(',');
+    // Cache key must include everything the panel displays. Resources have no
+    // `hp`, so keying on it alone produced NaN and the panel never refreshed —
+    // a selected tree or gold pile showed a frozen amount while it was mined.
+    const key = sel.map((e) => [
+      e.id,
+      Math.round(e.hp ?? -1),
+      Math.round(e.amount ?? -1),
+      Math.round(e.farmFood ?? -1),
+      Math.round(e.carrying?.amount ?? -1),
+      e.gatherers ?? -1,
+      e.queue ? e.queue.length : -1,
+      e.orders ? e.orders.length : -1,
+      e.task ? e.task.type : '',
+    ].join(':')).join(',');
     if (key === this.lastSelKey) return;
     this.lastSelKey = key;
     this.selPanel.innerHTML = '';
@@ -219,6 +283,11 @@ export class HUD {
   }
 
   _renderSingle(e) {
+    // Resource nodes are not units or buildings and carry no `def`; they need
+    // their own panel rather than falling through the unit path, which reads
+    // def.id / def.name / def.atk and throws.
+    if (e.kind === 'resource') return this._renderResource(e);
+
     const wrap = el('div', 'sel-single');
     const port = el('div', 'portrait');
     port.appendChild(imgIcon(e.kind === 'building' ? buildingIcon(e.type) : unitIcon(e.def), 56));
@@ -259,9 +328,32 @@ export class HUD {
     const classes = (d.classes || []).map((c) => ARMOR_CLASSES[c] || c).join(', ');
     if (classes) info.appendChild(el('div', 'sel-classes', 'Armor classes: ' + classes));
 
-    if (e.kind === 'unit' && e.carrying && e.carrying.amount > 0.5) {
+    // Villager inventory: always shown, so you can see how full a gatherer is
+    // and what it is hauling without waiting for it to reach a drop site.
+    if (e.kind === 'unit' && (e.def.cat === 'villager' || e.def.cat === 'naval')) {
+      const capAmt = this.game.carryCapacity(this.game.players[e.owner] || this.player);
+      const carried = e.carrying ? e.carrying.amount : 0;
+      const res = carried > 0.01 ? e.carrying.res : null;
+      const row = el('div', 'sel-carry-row');
+      row.appendChild(imgIcon(res ? resIcon(res) : 'villager', 16));
+      const label = el('span', 'carrytext',
+        res ? `${Math.floor(carried)} / ${capAmt} ${cap(res)}` : `Empty (holds ${capAmt})`);
+      row.appendChild(label);
+      const bar = el('div', 'carrybar');
+      const fill = el('div', 'carryfill');
+      fill.style.width = Math.min(100, (carried / capAmt) * 100) + '%';
+      fill.style.background = res
+        ? { food: '#e0695a', wood: '#b98040', gold: '#e0bc3c', stone: '#b8b8b0' }[res]
+        : '#666';
+      bar.appendChild(fill);
+      row.appendChild(bar);
+      info.appendChild(row);
+    } else if (e.kind === 'unit' && e.carrying && e.carrying.amount > 0.5) {
       info.appendChild(el('div', 'sel-carry',
         `Carrying ${Math.floor(e.carrying.amount)} ${e.carrying.res}`));
+    }
+    if (e.kind === 'unit' && e.orders && e.orders.length) {
+      info.appendChild(el('div', 'sel-task', `${e.orders.length} queued order${e.orders.length > 1 ? 's' : ''}`));
     }
     if (e.kind === 'unit' && e.task && e.task.type !== 'idle') {
       info.appendChild(el('div', 'sel-task', 'Task: ' + e.task.type));
@@ -276,8 +368,32 @@ export class HUD {
     if (e.kind === 'building' && e.def.farmFood) {
       info.appendChild(el('div', 'sel-task', `Food remaining ${Math.floor(e.farmFood)}`));
     }
+    // Live resource readout: how much is left, and who is working it.
     if (e.kind === 'resource') {
-      info.appendChild(el('div', 'sel-task', `${Math.floor(e.amount)} ${e.resType} remaining`));
+      info.appendChild(this._resourceBar(e.resType, e.amount, e.maxAmount));
+      const workers = this._gatherersOn(e.id);
+      info.appendChild(el('div', 'sel-task',
+        workers ? `${workers} gatherer${workers > 1 ? 's' : ''} working this` : 'Nobody gathering'));
+    }
+    // Huntable animals carry their food yield; a killed one leaves a carcass
+    // that depletes as it is butchered.
+    if (e.kind === 'unit' && e.def.huntable) {
+      info.appendChild(this._resourceBar('food', e.def.food || 0, e.def.food || 1));
+      const workers = this._gatherersOn(e.id);
+      info.appendChild(el('div', 'sel-task',
+        workers ? `${workers} hunting this` : 'Not being hunted'));
+    }
+    if (e.kind === 'building' && e.def.farmFood) {
+      info.appendChild(this._resourceBar('food', e.farmFood, e.farmMax || e.def.farmFood));
+      const workers = this._gatherersOn(e.id);
+      info.appendChild(el('div', 'sel-task',
+        workers ? `${workers} farming this` : 'Nobody farming this plot'));
+      if (e.owner === this.playerIndex) {
+        const cost = this.player.mods.building('farm').cost.wood;
+        info.appendChild(el('div', 'sel-classes', this.player.autoReseed
+          ? `Auto-reseed ON — costs ${cost} wood when exhausted`
+          : 'Auto-reseed OFF — plot will be lost when exhausted'));
+      }
     }
     wrap.appendChild(info);
 
@@ -305,6 +421,58 @@ export class HUD {
       wrap.appendChild(q);
     }
     this.selPanel.appendChild(wrap);
+  }
+
+  /** Selection panel for a resource node (tree, mine, bush, relic, carcass). */
+  _renderResource(e) {
+    const wrap = el('div', 'sel-single');
+    const port = el('div', 'portrait');
+    port.appendChild(imgIcon(RESOURCE_ICONS[e.type] || resIcon(e.resType), 56));
+    wrap.appendChild(port);
+
+    const info = el('div', 'sel-info');
+    info.appendChild(el('div', 'sel-name', RESOURCE_INFO[e.type]?.label || cap(e.type)));
+    info.appendChild(el('div', 'sel-owner', 'Natural resource'));
+
+    if (e.type === 'relic') {
+      info.appendChild(el('div', 'sel-stats', 'Carry to a Monastery for a steady gold income.'));
+    } else {
+      info.appendChild(this._resourceBar(e.resType, e.amount, e.maxAmount));
+      const workers = this._gatherersOn(e.id);
+      info.appendChild(el('div', 'sel-task',
+        workers ? `${workers} gatherer${workers > 1 ? 's' : ''} working this` : 'Nobody gathering'));
+      const pct = e.maxAmount ? Math.round((e.amount / e.maxAmount) * 100) : 0;
+      info.appendChild(el('div', 'sel-classes', `${pct}% remaining`));
+    }
+    wrap.appendChild(info);
+    this.selPanel.appendChild(wrap);
+  }
+
+  /** A labelled depletion bar, e.g. "168 / 200 Wood remaining". */
+  _resourceBar(res, amount, max) {
+    const row = el('div', 'sel-carry-row');
+    row.appendChild(imgIcon(resIcon(res), 16));
+    row.appendChild(el('span', 'carrytext',
+      `${Math.ceil(amount)} / ${Math.round(max)} ${cap(res)}`));
+    const bar = el('div', 'carrybar');
+    const fill = el('div', 'carryfill');
+    fill.style.width = Math.max(0, Math.min(100, (amount / (max || 1)) * 100)) + '%';
+    fill.style.background = { food: '#e0695a', wood: '#b98040', gold: '#e0bc3c', stone: '#b8b8b0' }[res] || '#888';
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    return row;
+  }
+
+  /** How many of the player's villagers are currently working a given target. */
+  _gatherersOn(id) {
+    let n = 0;
+    for (const e of this.game.entities) {
+      if (!e.alive || e.kind !== 'unit' || e.owner !== this.playerIndex) continue;
+      const t = e.task;
+      if ((t.type === 'gather' && t.targetId === id) ||
+          (t.type === 'deliver' && t.returnTo === id)) n++;
+    }
+    return n;
   }
 
   /* ---------------- command card ---------------- */
@@ -355,7 +523,14 @@ export class HUD {
       buttons.push(this._btn('move', 'Move', () => this.ctx.input.setCursorMode('move'), 'Move here.'));
       buttons.push(this._btn('attack', 'Attack Move', () => this.ctx.input.setCursorMode('attackMove'),
         'Advance to a point, engaging anything on the way. <b>[A]</b>'));
-      buttons.push(this._btn('stop', 'Stop', () => this.game.commandStop(units), 'Cancel all orders. <b>[S]</b>'));
+      buttons.push(this._btn('move', 'Patrol', () => this.ctx.input.setCursorMode('patrol'),
+        'Walk back and forth between here and the clicked point, attacking enemies met on the way. <b>[P]</b>'));
+      buttons.push(this._btn('stance', 'Hold Position', () => {
+        this.game.commandStop(units);
+        for (const u of units) u.stance = 'standGround';
+      }, 'Stop and never chase — only strike enemies that come into range. <b>[H]</b>'));
+      buttons.push(this._btn('stop', 'Stop', () => this.game.commandStop(units),
+        'Cancel the current action and clear the whole order queue. <b>[S]</b>'));
       buttons.push(this._btn('garrison', 'Garrison', () => this.ctx.input.setCursorMode('garrison'),
         'Garrison inside a building or siege unit. <b>[G]</b>'));
       const monks = units.filter((u) => u.def.converts);
@@ -392,12 +567,26 @@ export class HUD {
         for (const ex of this.player.mods.extraTrainers) {
           if (ex.building === b.type) trains.push(ex.unit);
         }
+        // Every selected building that can make this unit shares the batch, so
+        // a control group of Stables/Ranges fills up in parallel.
         for (const uId of dedupe(trains)) {
           if (!this.player.isUnitAvailable(uId)) continue;
           const def = this.player.mods.unit(uId);
-          buttons.push(this._btn(unitIcon(def), def.name, () => {
-            for (const bb of same) { if (this.game.queueUnit(bb, uId)) break; }
-          }, () => this._unitTooltip(def, true), !this.player.canAfford(def.cost)));
+          const able = buildings.filter((x) => this.game.canTrainAt(x, uId));
+          const pool = able.length ? able : same;
+          buttons.push(this._btn(unitIcon(def), def.name, (ev) => {
+            const n = ev && ev.shiftKey ? 5 : 1;
+            const r = this.game.queueUnitSpread(pool, uId, n);
+            if (r.queued > 1) {
+              this.player.notify(`Queued ${r.queued} ${def.name} across ${r.spread.length} building${r.spread.length > 1 ? 's' : ''}`);
+            }
+            this._cardKey = '';
+          }, () => this._unitTooltip(def, true) +
+             (pool.length > 1
+               ? `<div class="thint">${pool.length} buildings selected — orders go to whichever can start soonest.</div>`
+               : '') +
+             `<div class="dim">Shift-click to queue 5.</div>`,
+          !this.player.canAfford(def.cost)));
         }
         for (const tId of b.def.researches) {
           if (!this.player.isTechAvailable(tId)) continue;
@@ -432,6 +621,17 @@ export class HUD {
             for (const bb of same) this.game.ungarrisonAll(bb);
           }, 'Turn out all garrisoned units.'));
         }
+        if (b.def.farmFood) {
+          const on = this.player.autoReseed;
+          const woodCost = this.player.mods.building('farm').cost.wood;
+          buttons.push(this._btn('farm', `Reseed: ${on ? 'On' : 'Off'}`, () => {
+            this.player.autoReseed = !this.player.autoReseed;
+            this.player.notify(`Farm auto-reseed ${this.player.autoReseed ? 'enabled' : 'disabled'}`);
+            this._cardKey = '';
+          }, `<b>Automatic farm reseeding: ${on ? 'ON' : 'OFF'}</b><br>` +
+             `When a Farm is exhausted it is re-sown in place for ${woodCost} wood, ` +
+             `so the farmer never stops working. Turn off to let spent plots expire.`));
+        }
         buttons.push(this._btn('flag', 'Set Rally Point', () => this.ctx.input.setCursorMode('rally'),
           'New units gather here. Point it at a resource to auto-assign villagers.'));
         if (b.type === 'market') {
@@ -460,7 +660,7 @@ export class HUD {
     const b = el('button', 'cardbtn' + (disabled ? ' disabled' : ''));
     b.appendChild(imgIcon(iconName, 34));
     b.appendChild(el('span', 'cardlabel', label));
-    b.onclick = (e) => { e.stopPropagation(); onClick(); };
+    b.onclick = (e) => { e.stopPropagation(); onClick(e); };
     if (tooltip) this.tip(b, tooltip);
     return b;
   }
@@ -590,20 +790,33 @@ export class HUD {
       ctx.fillRect(e.x * k - size / 2, e.y * k - size / 2, size, size);
     }
 
-    // camera box
-    const r = this.ctx.renderer;
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 1;
-    const corners = [[0, 0], [r.viewW, 0], [r.viewW, r.viewH], [0, r.viewH]]
-      .map(([sx, sy]) => r.screenToWorld(sx, sy))
-      .filter(Boolean);
-    if (corners.length === 4) {
+    // Camera box. The canvas is full-window, but the part of it the player can
+    // actually see is only the band between the top bar and the bottom panel.
+    // Projecting the full canvas rect includes ground hidden behind the HUD -
+    // and because the projection is isometric, the hidden bottom strip is the
+    // nearest ground, so the box ends up noticeably forward of the real view.
+    const corners = this.viewportCorners();
+    if (corners) {
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(corners[0].x * k, corners[0].y * k);
       for (let i = 1; i < 4; i++) ctx.lineTo(corners[i].x * k, corners[i].y * k);
       ctx.closePath();
       ctx.stroke();
     }
+  }
+
+  /** World-space corners of the ground the player can actually see. */
+  viewportCorners() {
+    const r = this.ctx.renderer;
+    const top = this.topBar ? this.topBar.offsetHeight : 0;
+    const bottom = this.bottom ? this.bottom.offsetHeight : 0;
+    const w = r.viewW, h = r.viewH;
+    const y0 = top, y1 = Math.max(top + 1, h - bottom);
+    const pts = [[0, y0], [w, y0], [w, y1], [0, y1]]
+      .map(([sx, sy]) => r.screenToWorld(sx, sy));
+    return pts.every(Boolean) ? pts : null;
   }
 
   _minimapClick(e) {
@@ -673,16 +886,27 @@ export class HUD {
           <div>
             <h3>Controls</h3>
             <ul class="keys">
-              <li><b>Left click / drag</b> select unit or box-select</li>
-              <li><b>Right click</b> contextual order (move, attack, gather, build, garrison)</li>
-              <li><b>Shift + click</b> add to selection · <b>Double click</b> select all of type on screen</li>
-              <li><b>Ctrl+1..9</b> make control group · <b>1..9</b> recall</li>
-              <li><b>WASD / arrows / edge</b> pan · <b>wheel</b> zoom · <b>Q / E</b> rotate</li>
-              <li><b>H</b> Town Center · <b>.</b> next idle villager · <b>,</b> next idle military</li>
-              <li><b>A</b> attack-move · <b>S</b> stop · <b>G</b> garrison · <b>Delete</b> delete</li>
-              <li><b>B</b> economic build menu · <b>V</b> military build menu · <b>Esc</b> cancel</li>
-              <li><b>F3</b> tech tree · <b>F10</b> menu</li>
+              <li><b>Left click / drag</b> select unit, or box-select everything you own</li>
+              <li><b>Right click</b> smart order — move, attack, gather, build, repair, garrison</li>
+              <li><b>Shift + right click</b> <i>queue</i> an order instead of replacing</li>
+              <li><b>Shift + click a Mill / Town Center</b> with villagers selected —
+                builds one Farm per villager, packed around that building</li>
+              <li><b>Shift + click</b> add/remove from selection · <b>Double click</b> all of type on screen</li>
+              <li><b>Ctrl+1..9</b> make control group · <b>1..9</b> recall · <b>tap twice</b> centre</li>
+              <li><b>Arrows / edge / middle-drag</b> pan · <b>wheel</b> zoom · <b>Q / E</b> rotate</li>
+              <li><b>T</b> Town Center · <b>.</b> next idle villager · <b>,</b> next idle military</li>
+              <li><b>A</b> attack-move · <b>P</b> patrol · <b>H</b> hold position · <b>S</b> stop</li>
+              <li><b>G</b> garrison · <b>Delete</b> delete · <b>Esc</b> clear queued orders</li>
+              <li><b>B</b> economic build menu · <b>V</b> military build menu</li>
+              <li><b>F1</b> help · <b>F3</b> tech tree · <b>F10</b> menu</li>
             </ul>
+            <h3>Order queues</h3>
+            <p>Hold <b>Shift</b> and right-click repeatedly to chain any mix of orders —
+            walk here, chop that tree, mine that gold, repair that wall, attack that
+            unit. The chain is drawn as numbered waypoints joined by a dotted line.
+            A right-click <i>without</i> Shift replaces the whole queue immediately;
+            <b>Esc</b> drops the queue but lets the current action finish; <b>S</b>
+            cancels everything.</p>
           </div>
           <div>
             <h3>The counter system</h3>

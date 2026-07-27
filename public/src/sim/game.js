@@ -1,4 +1,4 @@
-// The simulation. Fixed-step, deterministic given a seed and the same commands.
+﻿// The simulation. Fixed-step, deterministic given a seed and the same commands.
 
 import { RNG } from '../core/rng.js';
 import { SpatialGrid } from '../core/grid.js';
@@ -14,7 +14,12 @@ import { CIVILIZATIONS } from '../data/civs.js';
 registerCivTable(CIVILIZATIONS);
 
 export const TICK = 1 / 20;          // 20 Hz simulation
-const PATH_BUDGET = 14;              // A* searches allowed per tick
+// A* searches allowed per tick. Too low and units spend many ticks waiting for
+// a route, during which they can only steer blindly toward the goal.
+const PATH_BUDGET = 48;
+// Long walks re-plan periodically so units route around things that appeared
+// after they set off (new buildings, felled trees, other players' walls).
+const REPLAN_INTERVAL = 2.5;
 const FOG_INTERVAL = 4;              // ticks between fog recomputes
 const CARRY_BASE = 10;
 
@@ -127,6 +132,11 @@ export class Game {
   }
 
   get(id) { const e = this.byId.get(id); return e && e.alive ? e : null; }
+
+  /** How much a player's villagers can carry before they must drop off. */
+  carryCapacity(pl) {
+    return Math.round((CARRY_BASE + pl.mods.carryAdd) * pl.mods.carryMult);
+  }
 
   spawnUnit(unitId, owner, x, y) {
     const pl = this.players[owner];
@@ -349,15 +359,40 @@ export class Game {
       u.pendingGoal = null;
       if (!goal) continue;
       const path = this.grid.findPath(u.x, u.y, goal, u.def.domain);
-      u.path = path && path.length ? path : null;
       u.pathIdx = 0;
-      if (!u.path) {
-        // fall back to a straight-line nudge so units never freeze outright
-        u.path = [{ x: goal.x, y: goal.y }];
-        u.pathIdx = 0;
+      if (path === null) {
+        // No route at all. Walking straight at the goal was the old behaviour
+        // and it is what made units grind into cliffs and shorelines: they take
+        // the direct line, jam against the obstacle and creep along it. Instead
+        // aim for the nearest tile we CAN stand on near the goal, and if even
+        // that fails, stop rather than shuffle into the scenery.
+        const near = this.grid.nearestOpen(goal.x, goal.y, u.def.domain, 10);
+        if (near) {
+          const retry = this.grid.findPath(u.x, u.y, { x: near.x, y: near.y, radius: 1 }, u.def.domain);
+          u.path = retry && retry.length ? retry : null;
+        } else {
+          u.path = null;
+        }
         u.pathFailed = true;
-      } else {
+        // Give up only after repeated failures. A single failed search is often
+        // transient - a unit momentarily boxed in by others - and cancelling the
+        // task outright would drop villagers off their job for no good reason.
+        u.pathFails = (u.pathFails || 0) + 1;
+        if (!u.path && u.pathFails >= 4) {
+          u.pathFails = 0;
+          u.task = { type: 'idle' };
+          u.moving = false;
+        }
+      } else if (path.length === 0) {
+        // Empty path means "already standing within the goal radius". That is
+        // success, not failure - clearing the path lets the task's own arrival
+        // check take over instead of re-pathing forever.
+        u.path = null;
         u.pathFailed = false;
+      } else {
+        u.path = path;
+        u.pathFailed = false;
+        u.pathFails = 0;
       }
       n++;
     }
@@ -388,6 +423,13 @@ export class Game {
 
     if (u.owner < 0) { this._updateAnimal(u, dt); return; }
 
+    // Single hand-off point for the shift queue: any task that finishes drops
+    // the unit to idle, and idle immediately pulls the next queued order. That
+    // keeps every task implementation unaware of queueing.
+    if (u.task.type === 'idle' && u.orders && u.orders.length) {
+      this._startOrder(u, u.orders.shift());
+    }
+
     switch (u.task.type) {
       case 'idle': this._taskIdle(u, dt); break;
       case 'move': this._taskMove(u, dt); break;
@@ -402,6 +444,7 @@ export class Game {
       case 'heal': this._taskHeal(u, dt); break;
       case 'trade': this._taskTrade(u, dt); break;
       case 'relic': this._taskRelic(u, dt); break;
+      case 'patrol': this._taskPatrol(u, dt); break;
       default: u.task = { type: 'idle' };
     }
   }
@@ -500,13 +543,76 @@ export class Game {
   _approach(u, target, range, dt) {
     const d = this._distTo(u, target);
     if (d <= range) { u.path = null; u.moving = false; return true; }
-    if ((!u.path || u.pathIdx >= u.path.length) && u.repathCd <= 0) {
-      u.repathCd = 0.5 + this.rng.next() * 0.4;
-      const goalR = target.kind === 'building' ? Math.ceil(target.size / 2 + range) : Math.max(1, Math.floor(range));
-      this.requestPath(u, { x: target.x, y: target.y, radius: goalR });
+    if (!u.path || u.pathIdx >= u.path.length) {
+      if (u.repathCd <= 0) {
+        u.repathCd = 0.4 + this.rng.next() * 0.3;
+        this.requestPath(u, this._approachGoal(u, target, range));
+      }
+      // Close the last fraction of a tile by steering straight in - A* can only
+      // land us on the neighbouring tile. Crucially this is ONLY for the final
+      // gap: using it at range makes a unit beeline into water or cliffs and
+      // scrape along them while it waits for a real path.
+      if (d < 2.5) this._stepToward(u, target.x, target.y, dt);
+      return false;
     }
     this._stepMove(u, dt);
     return false;
+  }
+
+  /** Direct, non-pathfinding step toward a point (used to close the last gap). */
+  _stepToward(u, tx, ty, dt) {
+    const dx = tx - u.x, dy = ty - u.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-4) return;
+    const sx = dx / dist, sy = dy / dist;
+    const step = Math.min(u.def.speed * dt, dist);
+    const nx = u.x + sx * step, ny = u.y + sy * step;
+    const domain = u.def.domain;
+    if (this.grid.isPassable(nx | 0, ny | 0, domain)) { u.x = nx; u.y = ny; }
+    else if (this.grid.isPassable(nx | 0, u.y | 0, domain)) u.x = nx;
+    else if (this.grid.isPassable(u.x | 0, ny | 0, domain)) u.y = ny;
+    u.facing = Math.atan2(sy, sx);
+    u.moving = true;
+  }
+
+  /**
+   * Where a unit should path to in order to end up within `range` of a target.
+   * For buildings that is the footprint tile nearest the unit (the tile itself
+   * is blocked, so the goal radius lets A* stop on the free tile beside it) -
+   * pathing to the centre of a 4x4 Town Center would otherwise stop several
+   * tiles short of the arrival check.
+   */
+  /**
+   * Best free tile to work a blocked resource from. Cardinal neighbours are
+   * strongly preferred: standing orthogonally puts the villager 1.0 tiles from
+   * the centre (and the hug step then closes it to ~0.5), whereas a diagonal
+   * bottoms out at 1.41 and looks detached.
+   */
+  _bestAdjacentTile(u, res) {
+    let best = null, bestScore = Infinity;
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    for (const [dx, dy] of dirs) {
+      const tx = res.tx + dx, ty = res.ty + dy;
+      if (!this.grid.isPassable(tx, ty, u.def.domain)) continue;
+      const px = tx + 0.5, py = ty + 0.5;
+      const diagonal = dx !== 0 && dy !== 0;
+      const score = Math.hypot(px - u.x, py - u.y) + (diagonal ? 1.5 : 0);
+      if (score < bestScore) { bestScore = score; best = { x: px, y: py }; }
+    }
+    return best;
+  }
+
+  _approachGoal(u, target, range) {
+    if (target.kind === 'resource' && RESOURCE_INFO[target.type]?.blocks) {
+      const spot = this._bestAdjacentTile(u, target);
+      if (spot) return { x: spot.x, y: spot.y, radius: 0 };
+    }
+    if (target.kind === 'building') {
+      const gx = Math.max(target.tx, Math.min(target.tx + target.size - 1, Math.round(u.x)));
+      const gy = Math.max(target.ty, Math.min(target.ty + target.size - 1, Math.round(u.y)));
+      return { x: gx, y: gy, radius: 1 };
+    }
+    return { x: target.x, y: target.y, radius: Math.max(1, Math.round(range + (target.radius || 0))) };
   }
 
   /* ---------------- tasks ---------------- */
@@ -546,6 +652,13 @@ export class Game {
       if (u.repathCd <= 0) { u.repathCd = 0.6; this.requestPath(u, { x: u.task.x, y: u.task.y, radius: 0 }); }
       return;
     }
+    // Re-plan mid-journey: the world changes while a unit is walking, and a
+    // route computed 20 seconds ago may now run through a wall.
+    u.replanT = (u.replanT || 0) + dt;
+    if (u.replanT > REPLAN_INTERVAL && u.path.length - u.pathIdx > 3) {
+      u.replanT = 0;
+      this.requestPath(u, { x: u.task.x, y: u.task.y, radius: 0 });
+    }
     if (this._stepMove(u, dt)) { u.task = { type: 'idle' }; u.moving = false; }
   }
 
@@ -564,10 +677,35 @@ export class Game {
     if (this._stepMove(u, dt)) u.task = { type: 'idle' };
   }
 
+  /** Walks back and forth between two points, engaging anything on the way. */
+  _taskPatrol(u, dt) {
+    const t = this._findTarget(u, u.def.los);
+    if (t) {
+      u.task = { type: 'attack', targetId: t.id, auto: true, resumePatrol: { ...u.task } };
+      return;
+    }
+    const tx = u.task.leg === 1 ? u.task.bx : u.task.ax;
+    const ty = u.task.leg === 1 ? u.task.by : u.task.ay;
+    if (!u.path) {
+      if (Math.hypot(tx - u.x, ty - u.y) < 1.0) {
+        u.task = { ...u.task, leg: u.task.leg === 1 ? 0 : 1 };
+        u.repathCd = 0;
+        return;
+      }
+      if (u.repathCd <= 0) { u.repathCd = 0.6; this.requestPath(u, { x: tx, y: ty, radius: 0 }); }
+      return;
+    }
+    if (this._stepMove(u, dt)) {
+      u.task = { ...u.task, leg: u.task.leg === 1 ? 0 : 1 };
+      u.repathCd = 0;
+    }
+  }
+
   _taskAttack(u, dt) {
     const target = this.get(u.task.targetId);
     if (!target || !target.alive || target.garrisonedIn) {
       if (u.task.resume) { u.task = { type: 'attackMove', x: u.task.resume.x, y: u.task.resume.y }; return; }
+      if (u.task.resumePatrol) { u.task = u.task.resumePatrol; return; }
       u.task = { type: 'idle' };
       return;
     }
@@ -665,9 +803,82 @@ export class Game {
 
   /* ---------------- gathering ---------------- */
 
+  /** True for a Farm, which is a building that behaves like a food resource. */
+  _isFarm(e) {
+    return !!(e && e.kind === 'building' && e.def.farmFood);
+  }
+
+  /** Remaining amount, whether the target is a resource node or a Farm. */
+  _amountOf(res) {
+    return this._isFarm(res) ? res.farmFood : res.amount;
+  }
+
+  _drawFrom(res, amt) {
+    if (this._isFarm(res)) res.farmFood -= amt;
+    else res.amount -= amt;
+  }
+
+  /**
+   * Re-sows an exhausted Farm in place, charging the normal Farm cost. Returns
+   * false if the player has it switched off or cannot afford the wood, in which
+   * case the caller lets the plot expire.
+   */
+  _tryReseedFarm(b) {
+    const pl = this.players[b.owner];
+    if (!pl || !pl.autoReseed) return false;
+    const def = pl.mods.building('farm');
+    if (!pl.canAfford(def.cost)) {
+      if (!b.reseedWarned) {
+        b.reseedWarned = true;
+        pl.notify('Not enough wood to reseed a Farm');
+      }
+      return false;
+    }
+    pl.spend(def.cost);
+    b.farmFood = def.farmFood + pl.mods.farmFoodAdd;
+    b.farmMax = b.farmFood;
+    b.hp = b.maxHp;
+    b.reseedWarned = false;
+    this.effects.push({ type: 'built', x: b.x, y: b.y, t: 0 });
+    return true;
+  }
+
+  /** The villager currently working a farm, or null if the plot is free. */
+  _farmWorker(farm) {
+    const cur = this.get(farm.farmer);
+    if (cur && cur.task && cur.task.type === 'gather' && cur.task.targetId === farm.id) return cur;
+    if (cur && cur.task && cur.task.type === 'deliver' && cur.task.returnTo === farm.id) return cur;
+    return null;
+  }
+
+  /**
+   * Nearest completed farm of this player with food left and nobody on it.
+   * `exclude` may be a single id or a Set, so a caller handing out several
+   * plots at once can skip the ones it has already promised.
+   */
+  _findFreeFarm(u, exclude) {
+    const skip = exclude instanceof Set
+      ? (id) => exclude.has(id)
+      : (id) => id === exclude;
+    let best = null, bestD = Infinity;
+    for (const e of this.entities) {
+      if (!e.alive || !this._isFarm(e) || e.owner !== u.owner) continue;
+      if (!e.complete || e.farmFood <= 0 || skip(e.id)) continue;
+      if (this._farmWorker(e)) continue;
+      const d = this._distTo(u, e);
+      if (d < bestD) { bestD = d; best = e; }
+    }
+    return best;
+  }
+
   _taskGather(u, dt) {
     const res = this.get(u.task.targetId);
-    if (!res || !res.alive || (res.kind === 'resource' && res.amount <= 0)) {
+    // Try to re-sow before deciding the plot is spent. Whichever ran first this
+    // tick - the farmer or the building update - the farmer keeps its job.
+    if (res && this._isFarm(res) && res.farmFood <= 0) this._tryReseedFarm(res);
+    if (!res || !res.alive ||
+        (res.kind === 'resource' && res.amount <= 0) ||
+        (this._isFarm(res) && res.farmFood <= 0)) {
       const next = this._findSameResourceNearby(u, u.task.resType);
       if (next) { u.task = { type: 'gather', targetId: next.id, resType: u.task.resType }; return; }
       if (u.carrying && u.carrying.amount > 0) { u.task = { type: 'deliver' }; return; }
@@ -686,30 +897,93 @@ export class Game {
       return;
     }
 
-    const reach = res.type === 'farm' ? 1.4 : 0.9;
-    if (this._distTo(u, res) > reach) { this._approach(u, res, reach - 0.2, dt); return; }
-    u.moving = false; u.path = null;
-    u.facing = Math.atan2(res.y - u.y, res.x - u.x);
+    const isFarm = this._isFarm(res);
+
+    if (isFarm) {
+      // One villager per plot, as in AoE2. If someone else already has this
+      // farm, quietly move to a free one rather than crowding it.
+      const worker = this._farmWorker(res);
+      if (worker && worker !== u) {
+        const alt = this._findFreeFarm(u, res.id);
+        u.task = alt ? { type: 'gather', targetId: alt.id, resType: 'food' } : { type: 'idle' };
+        return;
+      }
+      res.farmer = u.id;
+
+      // Farms are walkable, so the farmer stands in the middle of the plot
+      // rather than hovering at its edge.
+      const d = Math.hypot(res.x - u.x, res.y - u.y);
+      if (d > 0.5) {
+        if (!u.path || u.pathIdx >= u.path.length) {
+          if (u.repathCd <= 0) {
+            u.repathCd = 0.5;
+            this.requestPath(u, { x: res.x, y: res.y, radius: 0 });
+          }
+          this._stepToward(u, res.x, res.y, dt);
+        } else {
+          this._stepMove(u, dt);
+        }
+        return;
+      }
+      u.moving = false;
+      u.path = null;
+    } else {
+      // Trees, gold and stone occupy (and block) their tile, so a gatherer can
+      // only ever stand on a neighbouring one. In dense forest the only free
+      // neighbour may be diagonal, which is 1.41 tiles centre-to-centre - the
+      // gate has to tolerate that or a villager boxed in by trees would never
+      // start working. Non-blocking nodes (bushes, carcasses) allow a tighter gate.
+      const blocks = !!RESOURCE_INFO[res.type]?.blocks;
+      const reach = blocks ? 0.8 : 0.5;
+      const d = this._distTo(u, res);
+      if (d > reach) { this._approach(u, res, reach * 0.5, dt); return; }
+
+      u.path = null;
+      u.facing = Math.atan2(res.y - u.y, res.x - u.x);
+      // Having arrived, keep easing in so the villager ends up pressed right
+      // against the resource rather than stopping at the edge of the gate.
+      // Movement stops on its own at the blocked tile boundary.
+      if (d > 0.15) this._stepToward(u, res.x, res.y, dt * 0.6);
+      u.moving = false;
+    }
 
     const pl = this.players[u.owner];
-    const info = RESOURCE_INFO[res.type];
-    const sub = res.sub || info.res;
+    const info = isFarm ? RESOURCE_INFO.farm : RESOURCE_INFO[res.type];
+    const sub = res.sub || info.sub || info.res;
     const rate = info.gatherRate * (pl.mods.gather[sub] ?? 1) * (pl.mods.gather[info.res] ?? 1);
-    const cap = Math.round((CARRY_BASE + pl.mods.carryAdd) * pl.mods.carryMult);
+    const cap = this.carryCapacity(pl);
 
     if (!u.carrying || u.carrying.res !== info.res) u.carrying = { res: info.res, sub, amount: 0 };
-    const take = Math.min(rate * dt, res.amount, cap - u.carrying.amount);
+    // A Farm keeps its remaining food in `farmFood`, not `amount`; reading
+    // `amount` off a building yields undefined and makes this whole sum NaN, so
+    // the villager gathers forever and never fills up.
+    const remaining = this._amountOf(res);
+    const take = Math.min(rate * dt, remaining, cap - u.carrying.amount);
     u.carrying.amount += take;
-    res.amount -= take;
+    this._drawFrom(res, take);
     u.gathering = true;
 
-    if (res.amount <= 0) {
+    // Re-sow the moment the plot runs dry, rather than waiting for the building
+    // update later in the tick. Entities are processed in array order, so a
+    // farmer that ran first would see farmFood <= 0, abandon the farm, and only
+    // then would it be reseeded - leaving the villager standing idle beside a
+    // perfectly good plot.
+    if (isFarm && res.farmFood <= 0) this._tryReseedFarm(res);
+
+    if (!isFarm && res.amount <= 0) {
       res.alive = false;
       if (info.blocks) this.grid.blocked[res.ty * this.size + res.tx] = 0;
+      if (res.type === 'tree') {
+        // the renderer replays this as a tree toppling over
+        this.effects.push({
+          type: 'treeFall', x: res.x, y: res.y, t: 0,
+          variant: res.variant, angle: this.rng.range(0, Math.PI * 2),
+        });
+      }
     }
     if (u.carrying.amount >= cap - 1e-6) {
       // Khmer farmers deposit instantly
-      if (res.type === 'farm' && pl.mods.flags.has('instantFarmDrop')) {
+      if (isFarm && pl.mods.flags.has('instantFarmDrop')) {
         pl.give('food', u.carrying.amount);
         u.carrying.amount = 0;
       } else {
@@ -719,8 +993,12 @@ export class Game {
   }
 
   _findSameResourceNearby(u, resType) {
-    return this.entityGrid.nearest(u.x, u.y, 14, (e) =>
+    const node = this.entityGrid.nearest(u.x, u.y, 14, (e) =>
       e.kind === 'resource' && e.alive && e.amount > 0 && e.resType === resType && e.type !== 'relic');
+    if (node) return node;
+    // farms are buildings, so they never show up in the resource sweep above
+    if (resType === 'food') return this._findFreeFarm(u);
+    return null;
   }
 
   _taskDeliver(u, dt) {
@@ -731,7 +1009,7 @@ export class Game {
       if (!site) { u.task = { type: 'idle' }; return; }
       u.task = { ...u.task, siteId: site.id };
     }
-    if (this._distTo(u, site) > 0.6) { this._approach(u, site, 0.5, dt); return; }
+    if (this._distTo(u, site) > 1.25) { this._approach(u, site, 1.0, dt); return; }
     u.moving = false;
     const pl = this.players[u.owner];
     pl.give(u.carrying.res, u.carrying.amount);
@@ -739,13 +1017,21 @@ export class Game {
     if (u.carrying.res === 'stone' && pl.mods.flags.has('stoneGold')) pl.give('gold', u.carrying.amount * 0.35);
     if (u.carrying.sub === 'farm' && pl.mods.flags.has('farmGold')) pl.give('gold', u.carrying.amount * 0.25);
     u.carrying.amount = 0;
+    // A shift-queued follow-up takes priority over looping back to the resource,
+    // so "gather here, then go mine gold" behaves the way the player expects.
+    if (u.orders && u.orders.length) { u.task = { type: 'idle' }; return; }
+    // Go back to whatever we were working. `_amountOf` is used rather than
+    // `.amount` so Farms (buildings, which keep their food in `farmFood`) are
+    // handled too - reading `.amount` off a farm gives undefined, so the farmer
+    // would wander off to another food source after its very first delivery.
     const back = this.get(u.task.returnTo);
-    if (back && back.alive && back.amount > 0) {
+    if (back && back.alive && this._amountOf(back) > 0 &&
+        (!this._isFarm(back) || !this._farmWorker(back) || this._farmWorker(back) === u)) {
       u.task = { type: 'gather', targetId: back.id, resType: u.task.resType };
-    } else {
-      const next = this._findSameResourceNearby(u, u.task.resType);
-      u.task = next ? { type: 'gather', targetId: next.id, resType: u.task.resType } : { type: 'idle' };
+      return;
     }
+    const next = this._findSameResourceNearby(u, u.task.resType);
+    u.task = next ? { type: 'gather', targetId: next.id, resType: u.task.resType } : { type: 'idle' };
   }
 
   _findDropSite(u, res) {
@@ -764,13 +1050,14 @@ export class Game {
   _taskBuild(u, dt) {
     const b = this.get(u.task.targetId);
     if (!b || !b.alive || b.complete) {
+      if (u.orders && u.orders.length) { u.task = { type: 'idle' }; return; }
       // chain to the next foundation nearby, matching AoE2 villager behaviour
       const next = this.entityGrid.nearest(u.x, u.y, 8, (e) =>
         e.kind === 'building' && e.owner === u.owner && !e.complete);
       u.task = next ? { type: 'build', targetId: next.id } : { type: 'idle' };
       return;
     }
-    if (this._distTo(u, b) > 0.7) { this._approach(u, b, 0.6, dt); return; }
+    if (this._distTo(u, b) > 1.3) { this._approach(u, b, 1.0, dt); return; }
     u.moving = false; u.path = null;
     b.buildersThisTick++;
     u.building = true;
@@ -779,7 +1066,7 @@ export class Game {
   _taskRepair(u, dt) {
     const b = this.get(u.task.targetId);
     if (!b || !b.alive || b.hp >= b.maxHp) { u.task = { type: 'idle' }; return; }
-    if (this._distTo(u, b) > 0.7) { this._approach(u, b, 0.6, dt); return; }
+    if (this._distTo(u, b) > 1.3) { this._approach(u, b, 1.0, dt); return; }
     u.moving = false;
     const pl = this.players[u.owner];
     const rate = (b.maxHp / (b.def.time * 2)) * dt;
@@ -802,7 +1089,7 @@ export class Game {
     if (!b || !b.alive || !b.complete) { u.task = { type: 'idle' }; return; }
     const cap = b.def.garrison || 0;
     if (b.garrison.length >= cap) { u.task = { type: 'idle' }; return; }
-    if (this._distTo(u, b) > 0.6) { this._approach(u, b, 0.5, dt); return; }
+    if (this._distTo(u, b) > 1.25) { this._approach(u, b, 1.0, dt); return; }
     u.garrisonedIn = b.id;
     u.moving = false;
     u.task = { type: 'idle' };
@@ -891,7 +1178,7 @@ export class Game {
     const home = this.get(u.task.homeId);
     if (!market || !market.alive || !home || !home.alive) { u.task = { type: 'idle' }; return; }
     const dest = u.task.outbound ? market : home;
-    if (this._distTo(u, dest) > 0.8) { this._approach(u, dest, 0.7, dt); return; }
+    if (this._distTo(u, dest) > 1.3) { this._approach(u, dest, 1.0, dt); return; }
     if (!u.task.outbound) {
       const pl = this.players[u.owner];
       const dist = Math.hypot(market.x - home.x, market.y - home.y);
@@ -909,7 +1196,7 @@ export class Game {
       const mon = this.get(u.task.monasteryId) || this.entityGrid.nearest(u.x, u.y, 60,
         (e) => e.kind === 'building' && e.owner === u.owner && e.type === 'monastery' && e.complete);
       if (!mon) { u.task = { type: 'idle' }; return; }
-      if (this._distTo(u, mon) > 0.7) { this._approach(u, mon, 0.6, dt); return; }
+      if (this._distTo(u, mon) > 1.3) { this._approach(u, mon, 1.0, dt); return; }
       u.carryingRelic = false;
       mon.relics = (mon.relics || 0) + 1;
       this.players[u.owner].relics++;
@@ -917,7 +1204,7 @@ export class Game {
       return;
     }
     if (!relic || !relic.alive) { u.task = { type: 'idle' }; return; }
-    if (this._distTo(u, relic) > 0.7) { this._approach(u, relic, 0.6, dt); return; }
+    if (this._distTo(u, relic) > 1.1) { this._approach(u, relic, 0.8, dt); return; }
     relic.alive = false;
     u.carryingRelic = true;
     const mon = this.entityGrid.nearest(u.x, u.y, 60,
@@ -947,6 +1234,7 @@ export class Game {
           pl.notify(`${b.def.name} completed`);
           if (b.def.farmFood) { b.farmFood = b.def.farmFood + pl.mods.farmFoodAdd; b.farmMax = b.farmFood; }
           this.effects.push({ type: 'built', x: b.x, y: b.y, t: 0 });
+          this._onBuildingComplete(b);
         }
       }
       b.buildersThisTick = 0;
@@ -954,9 +1242,10 @@ export class Game {
     }
     b.buildersThisTick = 0;
 
-    // farms behave as a finite food source that villagers work
+    // Farms behave as a finite food source that villagers work. When exhausted
+    // they are re-sown if the player can pay for it, otherwise the plot is lost.
     if (b.def.farmFood) {
-      if (b.farmFood <= 0) { this.kill(b, null); }
+      if (b.farmFood <= 0 && !this._tryReseedFarm(b)) this.kill(b, null);
       return;
     }
 
@@ -982,6 +1271,78 @@ export class Game {
 
     this._updateProduction(b, pl, dt);
     this._updateBuildingAttack(b, pl, dt);
+  }
+
+  /**
+   * The moment a building finishes, put its builders to work on whatever that
+   * building was for: a Lumber Camp means trees, a Mill means food, a Mining
+   * Camp means gold, and a Farm means that farm. Saves the constant
+   * re-tasking of villagers that just dropped a drop-site next to a resource.
+   */
+  _onBuildingComplete(b) {
+    for (const u of this.entities) {
+      if (!u.alive || u.kind !== 'unit' || u.owner !== b.owner) continue;
+      if (u.def.cat !== 'villager') continue;
+      if (u.task.type !== 'build' || u.task.targetId !== b.id) continue;
+      if (u.orders && u.orders.length) continue;   // an explicit queue wins
+      this._assignWorkFor(u, b);
+    }
+  }
+
+  /** Picks the natural follow-up job for a villager that just built `b`. */
+  _assignWorkFor(u, b) {
+    if (this._isFarm(b)) {
+      // work the plot you just built, or the nearest other free one
+      const target = this._farmWorker(b) ? this._findFreeFarm(u, b.id) : b;
+      if (target) { u.task = { type: 'gather', targetId: target.id, resType: 'food' }; return true; }
+      return false;
+    }
+    const wants = {
+      lumberCamp: ['wood'],
+      mill: ['food'],
+      miningCamp: ['gold', 'stone'],
+      dock: ['food'],
+    }[b.type];
+    if (!wants) return false;
+
+    for (const res of wants) {
+      // generous radius: a drop site is often planted at the edge of a patch,
+      // and going idle beside a fresh Lumber Camp is the worst possible outcome
+      const node = this._nearestWorkable(b.x, b.y, u, res, 32);
+      if (node) {
+        u.task = { type: 'gather', targetId: node.id, resType: res };
+        u.repathCd = 0;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Nearest thing a villager can gather for `res`, searched around a point
+   * (normally the drop site, so they work the pile beside the camp). Covers
+   * resource nodes, huntable wildlife and free farms.
+   */
+  _nearestWorkable(x, y, u, res, radius) {
+    let best = null, bestD = Infinity;
+    const consider = (e, d) => { if (d < bestD) { bestD = d; best = e; } };
+    for (const e of this.entities) {
+      if (!e.alive) continue;
+      let ok = false;
+      if (e.kind === 'resource' && e.amount > 0 && e.type !== 'relic') {
+        ok = e.resType === res && !(RESOURCE_INFO[e.type]?.water && u.def.domain !== 'water');
+      } else if (res === 'food' && e.kind === 'unit' && e.owner < 0 &&
+                 e.def.huntable && !e.def.hostile) {
+        ok = true;
+      } else if (res === 'food' && this._isFarm(e) && e.owner === u.owner &&
+                 e.complete && e.farmFood > 0 && !this._farmWorker(e)) {
+        ok = true;
+      }
+      if (!ok) continue;
+      const d = Math.hypot(e.x - x, e.y - y);
+      if (d <= radius) consider(e, d);
+    }
+    return best;
   }
 
   _updateProduction(b, pl, dt) {
@@ -1222,49 +1583,147 @@ export class Game {
    *  Commands (issued by UI + AI)
    * ================================================================ */
 
-  commandMove(units, x, y) {
-    for (const u of units) {
-      if (!u.alive || u.garrisonedIn) continue;
-      u.task = { type: 'move', x, y };
-      u.repathCd = 0;
-      this.requestPath(u, { x, y, radius: 0 });
+  /**
+   * Central command entry point. `queue` (shift held) appends to the unit's
+   * order list instead of replacing it; without it the queue is cleared and the
+   * order starts immediately, which is the classic RTS contract.
+   */
+  issueCommands(units, makeOrder, queue) {
+    for (let i = 0; i < units.length; i++) {
+      const u = units[i];
+      if (!u || !u.alive || u.garrisonedIn) continue;
+      const order = makeOrder(u, i);
+      if (!order) continue;
+      if (!u.orders) u.orders = [];
+      if (queue) u.orders.push(order);
+      else { u.orders.length = 0; this._startOrder(u, order); }
     }
   }
 
-  commandAttackMove(units, x, y) {
-    for (const u of units) {
-      if (!u.alive || u.garrisonedIn) continue;
-      u.task = { type: 'attackMove', x, y };
-      u.repathCd = 0;
-      this.requestPath(u, { x, y, radius: 0 });
-    }
-  }
-
-  commandAttack(units, target) {
-    for (const u of units) {
-      if (!u.alive || u.garrisonedIn) continue;
-      if (u.def.converts && this.isEnemy(u.owner, target.owner)) {
-        u.task = { type: 'convert', targetId: target.id };
-      } else if (u.def.cat === 'villager' && target.kind === 'building' && this.isAlly(u.owner, target.owner)) {
-        u.task = target.complete ? { type: 'repair', targetId: target.id } : { type: 'build', targetId: target.id };
-      } else {
-        u.task = { type: 'attack', targetId: target.id };
+  /** Turns a queued order back into a live task. */
+  _startOrder(u, o) {
+    u.repathCd = 0;
+    switch (o.type) {
+      case 'move':
+        u.task = { type: 'move', x: o.x, y: o.y };
+        this.requestPath(u, { x: o.x, y: o.y, radius: 0 });
+        break;
+      case 'attackMove':
+        u.task = { type: 'attackMove', x: o.x, y: o.y };
+        this.requestPath(u, { x: o.x, y: o.y, radius: 0 });
+        break;
+      case 'patrol':
+        u.task = { type: 'patrol', ax: u.x, ay: u.y, bx: o.x, by: o.y, leg: 1 };
+        this.requestPath(u, { x: o.x, y: o.y, radius: 0 });
+        break;
+      case 'attack': {
+        const t = this.get(o.targetId);
+        if (!t) { u.task = { type: 'idle' }; break; }
+        if (u.def.converts && this.isEnemy(u.owner, t.owner)) u.task = { type: 'convert', targetId: t.id };
+        else u.task = { type: 'attack', targetId: t.id };
+        break;
       }
-      u.repathCd = 0;
+      case 'gather': u.task = { type: 'gather', targetId: o.targetId, resType: o.resType }; break;
+      case 'build': u.task = { type: 'build', targetId: o.targetId }; break;
+      case 'repair': u.task = { type: 'repair', targetId: o.targetId }; break;
+      case 'garrison': u.task = { type: 'garrison', targetId: o.targetId }; break;
+      case 'heal': u.task = { type: 'heal', targetId: o.targetId }; break;
+      case 'relic': u.task = { type: 'relic', targetId: o.targetId }; break;
+      case 'trade': u.task = { type: 'trade', marketId: o.targetId, homeId: o.homeId, outbound: true }; break;
+      default: u.task = { type: 'idle' }; break;
     }
   }
 
-  commandGather(units, res) {
-    for (const u of units) {
-      if (!u.alive || u.def.cat !== 'villager' && u.def.cat !== 'naval') continue;
-      if (res.kind === 'resource' && res.type === 'relic') continue;
-      const resType = res.kind === 'unit' ? 'food' : res.resType;
-      u.task = { type: 'gather', targetId: res.id, resType };
-      u.repathCd = 0;
+  /**
+   * Spreads a group's destination over a loose grid so units do not all
+   * converge on one tile and shove each other. Slots are handed out nearest
+   * first, which roughly preserves the group's existing arrangement.
+   */
+  _formationSlots(units, x, y) {
+    const n = units.length;
+    if (n <= 1) return [{ x, y }];
+    const spacing = 0.95;
+    const cols = Math.ceil(Math.sqrt(n));
+    const rows = Math.ceil(n / cols);
+    const slots = [];
+    for (let i = 0; i < n; i++) {
+      const r = Math.floor(i / cols), c = i % cols;
+      const ox = (c - (cols - 1) / 2) * spacing;
+      const oy = (r - (rows - 1) / 2) * spacing;
+      const open = this.grid.nearestOpen(x + ox, y + oy, units[0].def.domain, 4);
+      slots.push(open || { x: x + ox, y: y + oy });
     }
+    // greedy nearest assignment so the formation does not cross over itself
+    const out = new Array(n);
+    const taken = new Array(n).fill(false);
+    const order = units.map((u, i) => i)
+      .sort((a, b) => Math.hypot(units[a].x - x, units[a].y - y) - Math.hypot(units[b].x - x, units[b].y - y));
+    for (const ui of order) {
+      let best = -1, bestD = Infinity;
+      for (let s = 0; s < n; s++) {
+        if (taken[s]) continue;
+        const d = Math.hypot(slots[s].x - units[ui].x, slots[s].y - units[ui].y);
+        if (d < bestD) { bestD = d; best = s; }
+      }
+      taken[best] = true;
+      out[ui] = slots[best];
+    }
+    return out;
   }
 
-  commandBuild(units, bId, tx, ty) {
+  commandMove(units, x, y, queue) {
+    const slots = this._formationSlots(units, x, y);
+    this.issueCommands(units, (u, i) => ({ type: 'move', x: slots[i].x, y: slots[i].y }), queue);
+  }
+
+  commandAttackMove(units, x, y, queue) {
+    const slots = this._formationSlots(units, x, y);
+    this.issueCommands(units, (u, i) => ({ type: 'attackMove', x: slots[i].x, y: slots[i].y }), queue);
+  }
+
+  commandPatrol(units, x, y, queue) {
+    this.issueCommands(units, () => ({ type: 'patrol', x, y }), queue);
+  }
+
+  commandAttack(units, target, queue) {
+    this.issueCommands(units, (u) => {
+      if (u.def.cat === 'villager' && target.kind === 'building' && this.isAlly(u.owner, target.owner)) {
+        return { type: target.complete ? 'repair' : 'build', targetId: target.id };
+      }
+      return { type: 'attack', targetId: target.id };
+    }, queue);
+  }
+
+  commandGather(units, res, queue) {
+    const resType = res.kind === 'unit' ? 'food' : res.resType;
+    const target = this.get(res.id) || res;
+
+    // A Farm holds a single villager. Send the nearest one to the plot that was
+    // clicked and fan the rest out over other free plots, instead of piling
+    // everybody onto one farm where all but one would immediately bounce off.
+    if (this._isFarm(target)) {
+      const elig = units.filter((u) => u && u.alive && u.def.cat === 'villager' && !u.garrisonedIn);
+      if (!elig.length) return;
+      elig.sort((a, b) => this._distTo(a, target) - this._distTo(b, target));
+      const taken = new Set([target.id]);
+      this.issueCommands([elig[0]], () => ({ type: 'gather', targetId: target.id, resType: 'food' }), queue);
+      for (let i = 1; i < elig.length; i++) {
+        const free = this._findFreeFarm(elig[i], taken);
+        if (!free) continue;
+        taken.add(free.id);
+        this.issueCommands([elig[i]], () => ({ type: 'gather', targetId: free.id, resType: 'food' }), queue);
+      }
+      return;
+    }
+
+    this.issueCommands(units, (u) => {
+      if (u.def.cat !== 'villager' && u.def.cat !== 'naval') return null;
+      if (res.kind === 'resource' && res.type === 'relic') return null;
+      return { type: 'gather', targetId: res.id, resType };
+    }, queue);
+  }
+
+  commandBuild(units, bId, tx, ty, queue) {
     if (!units.length) return null;
     const owner = units[0].owner;
     const pl = this.players[owner];
@@ -1273,46 +1732,138 @@ export class Game {
     if (!this.canPlaceBuilding(bId, owner, tx, ty)) { pl.notify('Cannot build there'); return null; }
     pl.spend(def.cost);
     const b = this.placeBuilding(bId, owner, tx, ty, false);
-    for (const u of units) {
-      if (u.def.cat !== 'villager') continue;
-      u.task = { type: 'build', targetId: b.id };
-      u.repathCd = 0;
-    }
+    this.issueCommands(units, (u) =>
+      u.def.cat === 'villager' ? { type: 'build', targetId: b.id } : null, queue);
     return b;
   }
 
-  commandGarrison(units, building) {
-    for (const u of units) {
-      if (!u.alive || u.garrisonedIn) continue;
-      u.task = { type: 'garrison', targetId: building.id };
-      u.repathCd = 0;
+  /** Nearest free, completed farm to a building, ignoring already-claimed ids. */
+  _findFreeFarmNear(building, owner, claimed, radius) {
+    let best = null, bestD = Infinity;
+    for (const e of this.entities) {
+      if (!e.alive || !this._isFarm(e) || e.owner !== owner) continue;
+      if (!e.complete || e.farmFood <= 0 || claimed.has(e.id)) continue;
+      if (this._farmWorker(e)) continue;
+      const d = Math.hypot(e.x - building.x, e.y - building.y);
+      if (d <= radius && d < bestD) { bestD = d; best = e; }
     }
+    return best;
   }
 
-  commandRelic(units, relic) {
-    for (const u of units) {
-      if (u.def.converts) { u.task = { type: 'relic', targetId: relic.id }; u.repathCd = 0; }
+  /**
+   * Closest placeable farm footprint to a building.
+   * `taken` holds footprints reserved earlier in the same command: the entity
+   * spatial grid is only rebuilt once per tick, so canPlaceBuilding cannot see
+   * farms placed moments ago and every plot would land on the same tile.
+   */
+  _nearestFarmSpot(building, owner, taken) {
+    const size = this.players[owner].mods.building('farm').size;
+    const cx = building.x, cy = building.y;
+    const R = 11;
+    let best = null, bestD = Infinity;
+    for (let ty = Math.round(cy - R); ty <= Math.round(cy + R); ty++) {
+      for (let tx = Math.round(cx - R); tx <= Math.round(cx + R); tx++) {
+        const d = Math.hypot(tx + size / 2 - cx, ty + size / 2 - cy);
+        if (d >= bestD) continue;
+        if (taken.some((r) => tx < r.x + r.s && tx + size > r.x &&
+                              ty < r.y + r.s && ty + size > r.y)) continue;
+        if (!this.canPlaceBuilding('farm', owner, tx, ty)) continue;
+        bestD = d; best = { x: tx, y: ty, s: size };
+      }
     }
+    return best;
   }
 
-  commandHeal(units, target) {
-    for (const u of units) {
-      if (u.def.converts) { u.task = { type: 'heal', targetId: target.id }; u.repathCd = 0; }
+  /**
+   * Lays out farms around a food drop-off building and puts one villager on
+   * each: the bulk "make my farms" action. Reuses any idle plots already there
+   * before spending wood on new ones.
+   * @returns number of villagers given work
+   */
+  commandFarmAround(units, building, queue) {
+    const owner = building.owner;
+    const pl = this.players[owner];
+    if (!pl) return 0;
+    const villagers = units.filter((u) =>
+      u && u.alive && u.owner === owner && u.def.cat === 'villager' && !u.garrisonedIn);
+    if (!villagers.length) return 0;
+
+    // work outward from the building so the nearest villagers take the nearest plots
+    villagers.sort((a, b) => this._distTo(a, building) - this._distTo(b, building));
+
+    const def = pl.mods.building('farm');
+    const claimed = new Set();
+    const taken = [];
+    let assigned = 0;
+
+    for (const u of villagers) {
+      const free = this._findFreeFarmNear(building, owner, claimed, 12);
+      if (free) {
+        claimed.add(free.id);
+        this.issueCommands([u], () => ({ type: 'gather', targetId: free.id, resType: 'food' }), queue);
+        assigned++;
+        continue;
+      }
+      if (!pl.canAfford(def.cost)) { pl.notify('Not enough wood for more Farms'); break; }
+      const spot = this._nearestFarmSpot(building, owner, taken);
+      if (!spot) { pl.notify('No room for more Farms here'); break; }
+      pl.spend(def.cost);
+      taken.push(spot);
+      const b = this.placeBuilding('farm', owner, spot.x, spot.y, false);
+      this.issueCommands([u], () => ({ type: 'build', targetId: b.id }), queue);
+      assigned++;
     }
+    return assigned;
   }
 
-  commandTrade(units, market) {
-    for (const u of units) {
-      if (u.def.cat !== 'trade') continue;
+  /** Send villagers to help finish an existing foundation. */
+  commandBuildAt(units, building, queue) {
+    this.issueCommands(units, (u) =>
+      u.def.cat === 'villager' ? { type: 'build', targetId: building.id } : null, queue);
+  }
+
+  commandGarrison(units, building, queue) {
+    this.issueCommands(units, () => ({ type: 'garrison', targetId: building.id }), queue);
+  }
+
+  commandRepair(units, building, queue) {
+    this.issueCommands(units, (u) =>
+      u.def.cat === 'villager' ? { type: 'repair', targetId: building.id } : null, queue);
+  }
+
+  commandRelic(units, relic, queue) {
+    this.issueCommands(units, (u) =>
+      u.def.converts ? { type: 'relic', targetId: relic.id } : null, queue);
+  }
+
+  commandHeal(units, target, queue) {
+    this.issueCommands(units, (u) =>
+      u.def.converts ? { type: 'heal', targetId: target.id } : null, queue);
+  }
+
+  commandTrade(units, market, queue) {
+    this.issueCommands(units, (u) => {
+      if (u.def.cat !== 'trade') return null;
       const home = this.entityGrid.nearest(u.x, u.y, 80, (e) =>
         e.kind === 'building' && e.owner === u.owner && e.type === 'market' && e.complete);
-      if (!home) continue;
-      u.task = { type: 'trade', marketId: market.id, homeId: home.id, outbound: true };
+      if (!home) return null;
+      return { type: 'trade', targetId: market.id, homeId: home.id };
+    }, queue);
+  }
+
+  /** Stop: cancels the current task AND the whole queued order list. */
+  commandStop(units) {
+    for (const u of units) {
+      u.task = { type: 'idle' };
+      if (u.orders) u.orders.length = 0;
+      u.path = null;
+      u.moving = false;
     }
   }
 
-  commandStop(units) {
-    for (const u of units) { u.task = { type: 'idle' }; u.path = null; u.moving = false; }
+  /** Escape: keeps the current action, drops everything queued behind it. */
+  clearQueue(units) {
+    for (const u of units) if (u.orders) u.orders.length = 0;
   }
 
   queueUnit(building, unitId) {
@@ -1328,6 +1879,54 @@ export class Game {
       cost: def.cost, pop: def.pop, name: def.name,
     });
     return true;
+  }
+
+  /** Seconds of work already queued at a building before a new item would start. */
+  queueWaitTime(b) {
+    let t = 0;
+    for (const item of b.queue) t += Math.max(0, item.timeLeft);
+    return t;
+  }
+
+  /** Can this building train this unit (including a Castle's own unique unit)? */
+  canTrainAt(b, unitId) {
+    if (!b.complete) return false;
+    if (b.def.trains.includes(unitId)) return true;
+    const pl = this.players[b.owner];
+    if (!pl) return false;
+    if ((b.type === 'castle' || b.type === 'krepost' || b.type === 'donjon') &&
+        (unitId === pl.civ.uu || unitId === pl.civ.uuElite)) return true;
+    return pl.mods.extraTrainers.some((x) => x.building === b.type && x.unit === unitId);
+  }
+
+  /**
+   * Queues `count` of a unit across several buildings, each time picking the one
+   * that would start it soonest. A Stable part-way through a technology is
+   * skipped in favour of an idle one, so a batch finishes as early as possible
+   * instead of piling onto whichever building happened to be first.
+   * @returns {{queued:number, spread:number[]}} how many, and where
+   */
+  queueUnitSpread(buildings, unitId, count = 1) {
+    const eligible = buildings.filter((b) => b.alive && this.canTrainAt(b, unitId));
+    if (!eligible.length) return { queued: 0, spread: [] };
+    // local wait estimate so repeated picks in one batch account for each other
+    const wait = new Map(eligible.map((b) => [b.id, this.queueWaitTime(b)]));
+    const spread = new Map();
+    const def = this.players[eligible[0].owner].mods.unit(unitId);
+    let queued = 0;
+
+    for (let i = 0; i < count; i++) {
+      let best = null, bestW = Infinity;
+      for (const b of eligible) {
+        const w = wait.get(b.id);
+        if (w < bestW) { bestW = w; best = b; }
+      }
+      if (!best || !this.queueUnit(best, unitId)) break;
+      wait.set(best.id, bestW + def.time);
+      spread.set(best.id, (spread.get(best.id) || 0) + 1);
+      queued++;
+    }
+    return { queued, spread: [...spread.values()] };
   }
 
   queueTech(building, techId) {

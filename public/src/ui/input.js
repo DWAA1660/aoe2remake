@@ -61,6 +61,7 @@ export class Input {
     if (e.button === 0) {
       if (this.placement) { this._placeBuilding(e.shiftKey); return; }
       if (this.cursorMode) { this._applyCursorMode(pt, e.shiftKey); return; }
+      if (e.shiftKey && this._tryMassFarm(pt)) return;
       this.dragStart = pt;
       this.dragNow = pt;
     } else if (e.button === 2) {
@@ -148,6 +149,51 @@ export class Input {
     return best;
   }
 
+  /**
+   * Buildings-only pick. The general picker ranks units above buildings, so
+   * clicking a Mill with villagers milling around it returns a villager - no
+   * good when the whole point is to target the building.
+   */
+  _pickBuilding(sx, sy) {
+    let best = null, bestD = Infinity;
+    for (const e of this.game.entities) {
+      if (!e.alive || e.kind !== 'building') continue;
+      if (!this.game.revealAll && !this.player.hasExplored(e.x | 0, e.y | 0)) continue;
+      const h = this.renderer.heightAt(e.x, e.y) + e.size * 0.35;
+      const p = this.renderer.worldToScreen(e.x, h, e.y);
+      if (p.z > 1) continue;
+      const dx = p.x - sx, dy = p.y - sy;
+      const d = dx * dx + dy * dy;
+      const r = Math.max(26, e.size * 20);
+      if (d > r * r || d >= bestD) continue;
+      bestD = d; best = e;
+    }
+    return best;
+  }
+
+  /**
+   * Shift + click a food drop-off building with villagers selected: lay one
+   * farm per villager around it. Bound to BOTH mouse buttons, because "shift
+   * click the Mill" is equally natural with either and having it work on only
+   * one reads as the feature being broken.
+   * @returns true if it handled the click
+   */
+  _tryMassFarm(pt) {
+    const vills = this.selection.filter((e) =>
+      e.owner === this.playerIndex && e.kind === 'unit' && e.def.cat === 'villager');
+    if (!vills.length) return false;
+    const b = this._pickBuilding(pt.x, pt.y);
+    if (!b || b.owner !== this.playerIndex || !b.complete) return false;
+    if (!b.def.dropSite || !b.def.dropSite.includes('food')) return false;
+
+    const n = this.game.commandFarmAround(vills, b, false);
+    this.player.notify(n
+      ? `${n} villager${n > 1 ? 's' : ''} sent to farm around the ${b.def.name}`
+      : 'No room or not enough wood for farms here');
+    this._feedback(b.x, b.y, 'food', false);
+    return true;
+  }
+
   _singleClick(pt, additive, isDouble) {
     const hit = this.pickAt(pt.x, pt.y);
     if (!hit) { if (!additive) this.setSelection([]); return; }
@@ -182,10 +228,9 @@ export class Input {
       const p = this.renderer.worldToScreen(e.x, this.renderer.heightAt(e.x, e.y) + 0.4, e.y);
       if (p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1) found.push(e);
     }
-    // prefer military units when a box catches both soldiers and villagers
-    const military = found.filter((e) => e.def.cat !== 'villager' && e.def.cat !== 'trade');
-    const pick = military.length ? military : found;
-    this.setSelection(additive ? dedupe([...this.selection, ...pick]) : pick);
+    // Box select takes everything the player owns inside it, soldiers and
+    // villagers alike; shift-drag adds to the existing selection.
+    this.setSelection(additive ? dedupe([...this.selection, ...found]) : found);
   }
 
   setSelection(list) {
@@ -197,6 +242,12 @@ export class Input {
 
   /* ---------------- orders ---------------- */
 
+  /**
+   * Smart right click. Resolves the target into the single most obvious action,
+   * in the priority order of the classic RTS contract: continue construction ->
+   * repair -> garrison -> gather -> attack -> move. Holding shift appends the
+   * resulting order to each unit's queue instead of replacing it.
+   */
   _rightClick(pt, shift) {
     const mine = this.selection.filter((e) => e.owner === this.playerIndex);
     if (!mine.length) return;
@@ -204,6 +255,12 @@ export class Input {
     const buildings = mine.filter((e) => e.kind === 'building');
     const hit = this.pickAt(pt.x, pt.y);
     const world = this.renderer.screenToWorld(pt.x, pt.y);
+    const q = !!shift;
+
+    // Shift + click a Mill / Town Center / Dock with villagers selected lays a
+    // farm for each. Checked before normal target resolution so a villager
+    // standing in front of the building cannot swallow the click.
+    if (q && this._tryMassFarm(pt)) return;
 
     // right-clicking with a building selected sets its rally point
     if (buildings.length && !units.length) {
@@ -213,63 +270,72 @@ export class Input {
     }
     if (!units.length) return;
 
-    if (hit && hit !== undefined) {
+    if (hit) {
       if (hit.kind === 'resource') {
-        if (hit.type === 'relic') { this.game.commandRelic(units, hit); return; }
+        if (hit.type === 'relic') {
+          this.game.commandRelic(units, hit, q);
+          this._feedback(hit.x, hit.y, 'relic', q);
+          return;
+        }
         const gatherers = units.filter((u) => u.def.cat === 'villager');
-        if (gatherers.length) { this.game.commandGather(gatherers, hit); }
+        if (gatherers.length) this.game.commandGather(gatherers, hit, q);
         const rest = units.filter((u) => u.def.cat !== 'villager');
-        if (rest.length && world) this.game.commandMove(rest, world.x, world.y);
+        if (rest.length && world) this.game.commandMove(rest, world.x, world.y, q);
+        this._feedback(hit.x, hit.y, hit.resType || 'gather', q);
         return;
       }
       if (this.game.isEnemy(this.playerIndex, hit.owner) || hit.owner < 0) {
         // hunting: villagers gather from huntable gaia animals
         const vills = units.filter((u) => u.def.cat === 'villager');
         if (hit.owner < 0 && hit.kind === 'unit' && hit.def.huntable && vills.length) {
-          this.game.commandGather(vills, hit);
+          this.game.commandGather(vills, hit, q);
           const rest = units.filter((u) => u.def.cat !== 'villager');
-          if (rest.length) this.game.commandAttack(rest, hit);
+          if (rest.length) this.game.commandAttack(rest, hit, q);
+          this._feedback(hit.x, hit.y, 'food', q);
           return;
         }
-        this.game.commandAttack(units, hit);
+        this.game.commandAttack(units, hit, q);
+        this._feedback(hit.x, hit.y, 'attack', q);
         return;
       }
       if (hit.kind === 'building' && hit.owner === this.playerIndex) {
         const vills = units.filter((u) => u.def.cat === 'villager');
         const others = units.filter((u) => u.def.cat !== 'villager');
-        if (!hit.complete && vills.length) {
-          for (const v of vills) v.task = { type: 'build', targetId: hit.id };
-        } else if (vills.length && hit.hp < hit.maxHp) {
-          for (const v of vills) v.task = { type: 'repair', targetId: hit.id };
-        } else if (vills.length && hit.def.farmFood) {
-          this.game.commandGather(vills, { ...hit, kind: 'resource', resType: 'food', id: hit.id });
-        } else if (vills.length && hit.def.garrison) {
-          this.game.commandGarrison(vills, hit);
-        } else if (vills.length && world) {
-          this.game.commandMove(vills, world.x, world.y);
-        }
+
+        void vills;
+        let kind = 'move';
+        if (!hit.complete && vills.length) { this.game.commandBuildAt(vills, hit, q); kind = 'build'; }
+        else if (vills.length && hit.hp < hit.maxHp) { this.game.commandRepair(vills, hit, q); kind = 'repair'; }
+        else if (vills.length && hit.def.farmFood) {
+          this.game.commandGather(vills, { ...hit, kind: 'resource', resType: 'food', id: hit.id }, q);
+          kind = 'food';
+        } else if (vills.length && hit.def.garrison) { this.game.commandGarrison(vills, hit, q); kind = 'garrison'; }
+        else if (vills.length && world) this.game.commandMove(vills, world.x, world.y, q);
         if (others.length) {
-          if (hit.def.garrison) this.game.commandGarrison(others, hit);
-          else if (world) this.game.commandMove(others, world.x, world.y);
+          if (hit.def.garrison) { this.game.commandGarrison(others, hit, q); kind = 'garrison'; }
+          else if (world) this.game.commandMove(others, world.x, world.y, q);
         }
+        this._feedback(hit.x, hit.y, kind, q);
         return;
       }
       if (hit.kind === 'unit' && this.game.isAlly(this.playerIndex, hit.owner) && hit.owner !== this.playerIndex) {
         const monks = units.filter((u) => u.def.converts);
-        if (monks.length) { this.game.commandHeal(monks, hit); return; }
+        if (monks.length) { this.game.commandHeal(monks, hit, q); this._feedback(hit.x, hit.y, 'heal', q); return; }
       }
       if (hit.kind === 'unit' && hit.owner === this.playerIndex && hit.def.garrison) {
-        this.game.commandGarrison(units.filter((u) => u !== hit), hit);
+        this.game.commandGarrison(units.filter((u) => u !== hit), hit, q);
+        this._feedback(hit.x, hit.y, 'garrison', q);
         return;
       }
     }
     if (world) {
-      const monks = units.filter((u) => u.def.converts && u.hp < u.maxHp * 999);
-      void monks;
-      this.game.commandMove(units, world.x, world.y);
-      this.ctx.effects?.pushMoveMarker(world.x, world.y);
+      this.game.commandMove(units, world.x, world.y, q);
+      this._feedback(world.x, world.y, 'move', q);
     }
-    void shift;
+  }
+
+  _feedback(x, y, kind, queued) {
+    this.ctx.effects?.pushMarker(x, y, kind, queued);
   }
 
   setCursorMode(mode) {
@@ -285,23 +351,41 @@ export class Input {
     const buildings = this.selection.filter((e) => e.owner === this.playerIndex && e.kind === 'building');
     const world = this.renderer.screenToWorld(pt.x, pt.y);
     const hit = this.pickAt(pt.x, pt.y);
+    const q = !!shift;
     switch (mode) {
-      case 'move': if (world) this.game.commandMove(units, world.x, world.y); break;
-      case 'attackMove':
-        if (hit && this.game.isEnemy(this.playerIndex, hit.owner)) this.game.commandAttack(units, hit);
-        else if (world) this.game.commandAttackMove(units, world.x, world.y);
+      case 'move':
+        if (world) { this.game.commandMove(units, world.x, world.y, q); this._feedback(world.x, world.y, 'move', q); }
         break;
-      case 'garrison': if (hit && hit.owner === this.playerIndex) this.game.commandGarrison(units, hit); break;
-      case 'repair': if (hit && hit.kind === 'building') {
-        for (const u of units) if (u.def.cat === 'villager') u.task = { type: 'repair', targetId: hit.id };
-      } break;
-      case 'heal': if (hit) this.game.commandHeal(units, hit); break;
-      case 'relic': if (hit && hit.type === 'relic') this.game.commandRelic(units, hit); break;
-      case 'trade': if (hit && hit.type === 'market') this.game.commandTrade(units, hit); break;
+      case 'attackMove':
+        if (hit && this.game.isEnemy(this.playerIndex, hit.owner)) {
+          this.game.commandAttack(units, hit, q);
+          this._feedback(hit.x, hit.y, 'attack', q);
+        } else if (world) {
+          this.game.commandAttackMove(units, world.x, world.y, q);
+          this._feedback(world.x, world.y, 'attack', q);
+        }
+        break;
+      case 'patrol':
+        if (world) { this.game.commandPatrol(units, world.x, world.y, q); this._feedback(world.x, world.y, 'patrol', q); }
+        break;
+      case 'garrison':
+        if (hit && hit.owner === this.playerIndex) {
+          this.game.commandGarrison(units, hit, q);
+          this._feedback(hit.x, hit.y, 'garrison', q);
+        }
+        break;
+      case 'repair':
+        if (hit && hit.kind === 'building') {
+          this.game.commandRepair(units, hit, q);
+          this._feedback(hit.x, hit.y, 'repair', q);
+        }
+        break;
+      case 'heal': if (hit) this.game.commandHeal(units, hit, q); break;
+      case 'relic': if (hit && hit.type === 'relic') this.game.commandRelic(units, hit, q); break;
+      case 'trade': if (hit && hit.type === 'market') this.game.commandTrade(units, hit, q); break;
       case 'rally': if (world) for (const b of buildings) b.rally = world; break;
       default: break;
     }
-    void shift;
   }
 
   /* ---------------- building placement ---------------- */
@@ -338,7 +422,10 @@ export class Input {
       e.owner === this.playerIndex && e.kind === 'unit' && e.def.cat === 'villager');
     const builders = villagers.length ? villagers : this._nearestIdleVillagers(p.tx, p.ty, 2);
     if (!builders.length) { this.player.notify('Select a villager first'); return; }
-    this.game.commandBuild(builders, p.id, p.tx, p.ty);
+    // holding shift queues the foundation behind whatever they are doing, and
+    // keeps the placement cursor active so several can be laid in a row
+    this.game.commandBuild(builders, p.id, p.tx, p.ty, keepPlacing);
+    this._feedback(p.tx + p.size / 2, p.ty + p.size / 2, 'build', keepPlacing);
     if (!keepPlacing) this.cancelPlacement();
     else this._updatePlacement();
   }
@@ -386,14 +473,27 @@ export class Input {
         if (this.hud?.modalOpen) this.hud.hideModal();
         else if (this.placement) this.cancelPlacement();
         else if (this.cursorMode) { this.cursorMode = null; document.body.style.cursor = ''; }
-        else if (this.hud) { this.hud.cardMode = 'default'; this.hud._cardKey = ''; }
+        else if (units.some((u) => u.orders && u.orders.length)) {
+          // keep what they are doing, drop everything queued behind it
+          this.game.clearQueue(units);
+          this.player.notify('Queued orders cleared');
+        } else if (this.hud) { this.hud.cardMode = 'default'; this.hud._cardKey = ''; }
         break;
       case 'KeyA': if (units.length) this.setCursorMode('attackMove'); break;
+      case 'KeyP': if (units.length) this.setCursorMode('patrol'); break;
       case 'KeyS': if (units.length) this.game.commandStop(units); break;
       case 'KeyG': if (units.length) this.setCursorMode('garrison'); break;
       case 'KeyB': if (this.hud) { this.hud.cardMode = 'buildEco'; this.hud._cardKey = ''; } break;
       case 'KeyV': if (this.hud) { this.hud.cardMode = 'buildMil'; this.hud._cardKey = ''; } break;
-      case 'KeyH': this._selectTownCenter(); break;
+      case 'KeyH':
+        // Hold Position: stop where you are and never chase
+        if (units.length) {
+          this.game.commandStop(units);
+          for (const u of units) u.stance = 'standGround';
+          this.player.notify('Holding position');
+        } else this._selectTownCenter();
+        break;
+      case 'KeyT': this._selectTownCenter(); break;
       case 'KeyQ': this.renderer.rotate(-1); break;
       case 'KeyE': this.renderer.rotate(1); break;
       case 'Period': this._cycleIdle('villager'); break;
@@ -427,6 +527,21 @@ export class Input {
     const tc = tcs[this._tcIdx];
     this.setSelection([tc]);
     this.renderer.centerOn(tc.x, tc.y);
+  }
+
+  /** Selects every idle unit of a kind, so one order can put them all to work. */
+  selectAllIdle(kind) {
+    const list = this.game.entities.filter((e) => {
+      if (!e.alive || e.kind !== 'unit' || e.owner !== this.playerIndex) return false;
+      if (e.task.type !== 'idle' || e.garrisonedIn) return false;
+      if (e.orders && e.orders.length) return false;
+      return kind === 'villager' ? e.def.cat === 'villager'
+        : (e.def.cat !== 'villager' && e.def.cat !== 'trade');
+    });
+    if (!list.length) { this.player.notify(`No idle ${kind}s`); return; }
+    this.setSelection(list);
+    this.renderer.centerOn(list[0].x, list[0].y);
+    this.player.notify(`Selected ${list.length} idle ${kind}${list.length > 1 ? 's' : ''}`);
   }
 
   _cycleIdle(kind) {

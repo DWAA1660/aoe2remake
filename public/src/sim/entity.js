@@ -30,6 +30,7 @@ export function makeUnit(def, owner, x, y) {
     radius: def.radius,
     speed: def.speed,
     task: { type: 'idle' },
+    orders: [],              // shift-queued follow-up orders, executed in turn
     path: null,
     pathIdx: 0,
     repathCd: 0,
@@ -74,6 +75,7 @@ export function makeBuilding(def, owner, tx, ty, complete = false) {
     attackCd: 0,
     farmFood: def.farmFood || 0,
     farmMax: def.farmFood || 0,
+    farmer: 0,               // a farm is worked by exactly one villager
     relics: 0,
     selected: false,
     alive: true,

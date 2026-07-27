@@ -1,16 +1,25 @@
-// Computer opponent: a build-order driven economy plus a counter-aware army
+﻿// Computer opponent: a build-order driven economy plus a counter-aware army
 // composition. It reads the same public command API the human UI uses.
 
 import { TECHS } from '../data/techs.js';
 import { AGES } from './player.js';
 
-const VILL_TARGET = { dark: 22, feudal: 34, castle: 55, imperial: 75 };
+const VILL_TARGET = { dark: 20, feudal: 34, castle: 55, imperial: 75 };
 const RES_SPLIT = {
   dark: { food: 0.55, wood: 0.35, gold: 0.10, stone: 0.0 },
   feudal: { food: 0.40, wood: 0.32, gold: 0.20, stone: 0.08 },
   castle: { food: 0.34, wood: 0.28, gold: 0.28, stone: 0.10 },
   imperial: { food: 0.32, wood: 0.26, gold: 0.32, stone: 0.10 },
 };
+
+/**
+ * Villager count at which the AI is willing to age up â€” and, identically, the
+ * count at which it starts banking food instead of making more villagers.
+ * These two must use the same number: if the saving gate trips before the
+ * age-up gate, the AI stops producing villagers while still refusing to age,
+ * and sits in the Dark Age forever.
+ */
+const ageGate = (age) => Math.round(VILL_TARGET[age] * 0.7);
 
 const TECH_PRIORITY = [
   'loom', 'doubleBitAxe', 'horseCollar', 'wheelbarrow', 'goldMining',
@@ -114,9 +123,26 @@ export class AI {
   }
 
   manageVillagers() {
-    // keep the Town Centers producing villagers
+    // Keep the Town Centers producing villagers - but stop once we are close to
+    // the age-up so the food actually banks instead of turning into more
+    // villagers forever.
     const target = VILL_TARGET[this.p.age];
-    if (this.mine.villagers.length < target) {
+    const nextAge = AGES[this.p.ageIndex + 1];
+    const ageTechId = nextAge ? nextAge + 'Age' : null;
+    let saving = false;
+    if (ageTechId && TECHS[ageTechId] && !this.p.researched.has(ageTechId) &&
+        !this.p.researching.has(ageTechId) &&
+        this.mine.villagers.length >= ageGate(this.p.age)) {
+      const ageCost = this.p.mods.techCost(TECHS[ageTechId]);
+      saving = this.p.res.food < ageCost.food + 60;
+      // Only choke military production once the bank is genuinely close, so the
+      // AI is not defenceless for the whole age while it saves.
+      this.ageProgress = ageCost.food ? this.p.res.food / ageCost.food : 1;
+    } else {
+      this.ageProgress = 0;
+    }
+    this.savingForAge = saving;
+    if (this.mine.villagers.length < target && !saving) {
       for (const tc of this.buildingsOf('townCenter')) {
         if (tc.queue.length < 2) this.game.queueUnit(tc, 'villager');
       }
@@ -162,14 +188,15 @@ export class AI {
     }
     if (best) { g.commandGather([v], best); return true; }
     if (res === 'food') {
-      // build a farm instead
+      // Prefer an existing plot nobody is working - farms take one villager each.
+      const freeFarm = g._findFreeFarm(v);
+      if (freeFarm) { g.commandGather([v], freeFarm); return true; }
+      // otherwise lay a new one next to the Mill or Town Center
       const mill = this.building('mill') || this.tc;
       if (mill && this.p.canAfford(this.p.mods.building('farm').cost)) {
         const spot = this.findSpot('farm', mill.x, mill.y, 3, 10);
         if (spot) { g.commandBuild([v], 'farm', spot.x, spot.y); return true; }
       }
-      const farm = this.mine.buildings.find((b) => b.type === 'farm' && b.complete && b.farmFood > 0);
-      if (farm) { g.commandGather([v], { ...farm, kind: 'resource', resType: 'food', id: farm.id }); return true; }
     }
     return false;
   }
@@ -210,7 +237,7 @@ export class AI {
     if (!this.p.isTechAvailable(techId)) return;
     const cost = this.p.mods.techCost(TECHS[techId]);
     if (!this.p.canAfford(cost)) return;
-    if (this.mine.villagers.length < VILL_TARGET[this.p.age] * 0.7) return;
+    if (this.mine.villagers.length < ageGate(this.p.age)) return;
     this.game.queueTech(tc, techId);
   }
 
@@ -297,7 +324,13 @@ export class AI {
     const g = this.game;
     const comp = this.desiredComposition();
     if (!comp.length) return;
-    const producers = this.mine.buildings.filter((b) =>
+    // Do not burn the age-up food on units, and keep the Dark Age to a token
+    // defensive force - real AoE2 openings do not mass Militia.
+    const armyCap = this.p.ageIndex === 0 ? 4 : Infinity;
+    const holdProduction = (this.savingForAge && this.ageProgress > 0.5) ||
+      this.mine.army.length >= armyCap;
+
+    const producers = holdProduction ? [] : this.mine.buildings.filter((b) =>
       b.complete && b.def.trains.length && b.type !== 'townCenter' && b.type !== 'dock' && b.type !== 'market');
     let ci = 0;
     for (const b of producers) {
@@ -387,8 +420,9 @@ export class AI {
       const t = TECHS[id];
       const cost = this.p.mods.techCost(t);
       if (!this.p.canAfford(cost)) continue;
-      // keep a buffer so research never starves unit production
-      if (this.p.res.food < cost.food + 150) continue;
+      // keep a food buffer so research never starves villager production,
+      // but never block techs that cost no food at all (Loom, Bloodlines...)
+      if (cost.food > 0 && this.p.res.food < cost.food + 150) continue;
       const b = this.buildingsOf(t.building).find((x) => x.queue.length === 0);
       if (b && this.game.queueTech(b, id)) return;
     }

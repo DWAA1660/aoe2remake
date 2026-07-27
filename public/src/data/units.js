@@ -43,6 +43,10 @@ function U(id, def) {
   u.bonus = def.bonus || {};
   // fold bonus components into the attack table
   u.atk = { ...(def.atk || DEFAULTS.atk), ...u.bonus };
+  // Every class the unit belongs to gets an explicit armor entry (0 unless the
+  // unit was given a real value). computeDamage only applies a bonus component
+  // when the matching entry exists, which is what makes counters selective.
+  for (const c of u.classes) if (u.armor[c] === undefined) u.armor[c] = 0;
   DB[id] = u;
   return u;
 }

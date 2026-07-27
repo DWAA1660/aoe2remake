@@ -46,6 +46,10 @@ export class Player {
     if (this.civ.team) this.mods.add(this.civ.team.effects);
     for (const r in this.mods.startResources) this.res[r] += this.mods.startResources[r];
 
+    // Exhausted farms are re-sown automatically while wood allows, so farmers
+    // are not left idle. Toggleable from a selected Farm's command card.
+    this.autoReseed = true;
+
     this.notifications = [];
   }
 

@@ -7,6 +7,7 @@ import { Game, TICK } from '../public/src/sim/game.js';
 import { AI } from '../public/src/sim/ai.js';
 import { CIV_IDS, CIVILIZATIONS } from '../public/src/data/civs.js';
 import { UNITS } from '../public/src/data/units.js';
+import { BUILDINGS } from '../public/src/data/buildings.js';
 import { computeDamage } from '../public/src/data/armor.js';
 
 const minutes = parseFloat(process.argv[2] || '10');
@@ -43,12 +44,21 @@ console.log('\n=== Counter system ===');
   const camelVsKnight = computeDamage(camel.atk, knight.armor);
   assert(camelVsKnight > 15, `Heavy Camel shreds Knights (${camelVsKnight})`);
 
-  const halbVsCata = computeDamage(halb.atk, cata.armor);
-  assert(halbVsCata < halbVsKnight,
-    `Cataphract's infantry armour blunts Halberdier bonus (${halbVsCata} vs ${halbVsKnight} on a Knight)`);
+  assert(halbVsKnight === 30, `Halberdier vs Knight is exactly melee(6-2) + cavalry(26) = 30, got ${halbVsKnight}`);
 
-  const ramVsHouse = computeDamage(UNITS.siegeRam.atk, { melee: 0, pierce: 7, building: 0 });
+  const jag = UNITS.eliteJaguarWarrior;
+  const jagVsChamp = computeDamage(jag.atk, champ.armor);
+  const jagVsCata = computeDamage(jag.atk, cata.armor);
+  assert(jagVsCata < jagVsChamp,
+    `Cataphract's 16 infantry armour blunts anti-infantry bonuses (${jagVsCata} vs ${jagVsChamp} on a Champion)`);
+
+  const halbVsHalb = computeDamage(halb.atk, halb.armor);
+  assert(halbVsHalb === 6, `Halberdier's cavalry bonus does NOT apply to other infantry (${halbVsHalb})`);
+
+  const ramVsHouse = computeDamage(UNITS.siegeRam.atk, BUILDINGS.house.armor);
+  const ramVsKnight = computeDamage(UNITS.siegeRam.atk, knight.armor);
   assert(ramVsHouse > 190, `Siege Ram devastates buildings (${ramVsHouse})`);
+  assert(ramVsKnight <= 2, `Siege Ram is harmless to units — no building bonus leaks (${ramVsKnight})`);
 
   const knightVsHalb = computeDamage(knight.atk, halb.armor);
   assert(knightVsHalb === 10, `Knight has no bonus vs Halberdier (${knightVsHalb})`);

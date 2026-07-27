@@ -2,7 +2,7 @@
 // orthographic camera, rendered into a low-resolution buffer and upscaled with
 // nearest-neighbour filtering. That gives the "3D model, 2D pixel art" hybrid.
 
-import { buildAllGeometries, unitMeshKey, buildingMeshKey, TEAM_COLOR_SENTINEL } from './meshes.js';
+import { buildAllGeometries, unitMeshKeyFor, buildingMeshKey, TEAM_COLOR_SENTINEL } from './meshes.js';
 import { TERRAIN } from '../sim/map.js';
 import { RESOURCE_INFO } from '../sim/entity.js';
 
@@ -11,16 +11,27 @@ export const PLAYER_COLORS = [
   0x2ec6c6, 0x9b45c9, 0xb0b0b0, 0xe07a25,
 ];
 
+// Age of Empires II "Arabia" ground palette: yellow-leaning grass, sun-bleached
+// dirt paths and warm sand, rather than the cool forest green of a temperate map.
 const TERRAIN_COLORS = {
-  [TERRAIN.GRASS]: [0x5f8f43, 0x6b9a4c],
-  [TERRAIN.GRASS2]: [0x517f3a, 0x5c8a42],
-  [TERRAIN.DIRT]: [0x8a7449, 0x957e52],
-  [TERRAIN.SAND]: [0xc4b27a, 0xcdbb84],
-  [TERRAIN.WATER]: [0x24506e, 0x27587a],
-  [TERRAIN.SHALLOW]: [0x3a7794, 0x40819e],
+  [TERRAIN.GRASS]: [0x86a247, 0x91ad51],
+  [TERRAIN.GRASS2]: [0x9aad55, 0xa4b75f],
+  [TERRAIN.DIRT]: [0xb59a63, 0xc0a56e],
+  [TERRAIN.SAND]: [0xd8c48a, 0xe1ce95],
+  [TERRAIN.WATER]: [0x2f6f96, 0x347aa3],
+  [TERRAIN.SHALLOW]: [0x59a2b8, 0x63aec3],
 };
 
 const TILE_H = 0.55;   // world height of one elevation step
+
+// How far back the orthographic camera sits. Anything distance-based (near/far
+// planes, any scene fog) must be expressed relative to this, or it will apply to
+// the whole world at once.
+const CAMERA_DIST = 160;
+
+// Seconds for a chopped tree to topple. Must stay under the effect lifetime in
+// Game._updateEffects, or the tree pops out mid-fall.
+const TREE_FALL_TIME = 1.05;
 
 export class Renderer {
   constructor(THREE, canvas, game) {
@@ -33,10 +44,17 @@ export class Renderer {
     this.renderer.setClearColor(0x1a1a22, 1);
 
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x141820);
-    this.scene.fog = new THREE.Fog(0x141820, 60, 130);
+    // Neutral near-black void beyond the map edge; a navy background reads as a
+    // blue wash once it shows through around the coastline.
+    this.scene.background = new THREE.Color(0x0c0c0e);
+    // No distance fog: the orthographic camera is parked CAMERA_DIST units back,
+    // so any fog range smaller than that silently paints the entire world in the
+    // background colour. Fog-of-war darkening is done per-tile in the terrain
+    // shader instead (see _buildTerrain).
 
-    this.pixelScale = 0.5;
+    // 1.0 = render at full resolution (crisp). Lower values downsample and
+    // nearest-upscale for the chunky retro look; the Menu has a slider.
+    this.pixelScale = 1.0;
     this._setupCamera();
     this._setupLights();
 
@@ -58,16 +76,18 @@ export class Renderer {
 
   _setupCamera() {
     const THREE = this.THREE;
-    this.camera = new THREE.OrthographicCamera(-20, 20, 12, -12, 0.1, 400);
+    // Orthographic: the pull-back distance does not change apparent size, it
+    // only has to clear the tallest geometry. Near/far bracket it generously.
+    this.camera = new THREE.OrthographicCamera(-20, 20, 12, -12, 1, CAMERA_DIST * 2.5);
     this.yaw = Math.PI / 4;
     this.pitch = 0.62;
-    this.zoom = 22;               // half-width of the view in tiles
+    this.zoom = 15;               // half-height of the view in tiles
     this.center = { x: this.game.size / 2, y: this.game.size / 2 };
     this._applyCamera();
   }
 
   _applyCamera() {
-    const d = 160;
+    const d = CAMERA_DIST;
     const cx = this.center.x, cz = this.center.y;
     const cy = 0;
     const dirX = Math.cos(this.yaw) * Math.cos(this.pitch);
@@ -79,23 +99,61 @@ export class Renderer {
   }
 
   setZoom(z) {
-    this.zoom = Math.max(9, Math.min(60, z));
+    this.zoom = Math.max(7, Math.min(45, z));
     this.resize();
   }
 
+  /**
+   * Pan by a screen-space delta (+dx = view moves right, +dy = view moves down),
+   * converted into world XZ.
+   *
+   * Derivation, so this does not get sign-flipped again. The camera looks from
+   * `center + dir * d` back at `center`, with dir = (cos y * cos p, sin p,
+   * sin y * cos p) and world up (0,1,0). Its forward is -dir, so:
+   *
+   *   right  = normalise(cross(forward, up)) = ( sin y, 0, -cos y)
+   *   up     = cross(right, forward), projected to the ground and normalised
+   *          = (-cos y, 0, -sin y)   ->  screen-down is (cos y, 0, sin y)
+   *
+   * Moving the view right therefore advances `center` along `right`, and moving
+   * it down advances along screen-down. (`center.y` holds the world Z axis.)
+   */
   panBy(dx, dy) {
-    // pan in screen space, converted to world XZ
     const s = Math.sin(this.yaw), c = Math.cos(this.yaw);
-    this.center.x += dx * -s + dy * -c;
-    this.center.y += dx * c + dy * -s;
+    this.center.x += dx * s + dy * c;
+    this.center.y += dx * -c + dy * s;
     const m = this.game.size;
     this.center.x = Math.max(0, Math.min(m, this.center.x));
     this.center.y = Math.max(0, Math.min(m, this.center.y));
     this._applyCamera();
   }
 
+  /**
+   * The HUD covers the top and bottom of the canvas, so the middle of the
+   * *visible* 3D band is not the middle of the canvas. Telling the renderer how
+   * much is covered lets centreing put things where the player can actually see
+   * them, and lets the minimap draw a viewport box that matches.
+   */
+  setViewportInsets(top, bottom) {
+    this.insetTop = top || 0;
+    this.insetBottom = bottom || 0;
+  }
+
+  /** World-space offset from the canvas centre to the visible-band centre. */
+  viewCenterOffset() {
+    const top = this.insetTop || 0, bottom = this.insetBottom || 0;
+    if (!top && !bottom) return { x: 0, y: 0 };
+    const a = this.screenToWorld(this.viewW / 2, this.viewH / 2);
+    const b = this.screenToWorld(this.viewW / 2, (top + (this.viewH - bottom)) / 2);
+    if (!a || !b) return { x: 0, y: 0 };
+    return { x: b.x - a.x, y: b.y - a.y };
+  }
+
+  /** Centres the view on a world point, accounting for the HUD insets. */
   centerOn(x, y) {
-    this.center.x = x; this.center.y = y;
+    const off = this.viewCenterOffset();
+    this.center.x = x - off.x;
+    this.center.y = y - off.y;
     this._applyCamera();
   }
 
@@ -106,13 +164,27 @@ export class Renderer {
 
   _setupLights() {
     const THREE = this.THREE;
-    const sun = new THREE.DirectionalLight(0xfff2d0, 1.15);
-    sun.position.set(0.6, 1.0, 0.35);
+    // three.js r155+ dropped legacy lighting: a Lambert surface reflects
+    // albedo * intensity / PI, where the old model effectively multiplied
+    // intensity by PI. Every intensity here is therefore ~PI x what it would
+    // have been, otherwise the whole scene renders at a third brightness.
+    const PI = Math.PI;
+
+    // Age of Empires reads as a warm, high-noon Mediterranean scene: a strong
+    // golden key light and very little cool light. An overly blue sky/fill is
+    // what makes a scene look like overcast dusk, so both are kept weak and
+    // close to neutral here.
+    const sun = new THREE.DirectionalLight(0xfff0cf, 1.45 * PI);
+    sun.position.set(0.55, 1.0, 0.4);
     this.scene.add(sun);
-    const fill = new THREE.DirectionalLight(0x8fa8d0, 0.45);
-    fill.position.set(-0.5, 0.4, -0.7);
+
+    // barely-tinted bounce so shadowed faces stay readable without going blue
+    const fill = new THREE.DirectionalLight(0xd8dcea, 0.22 * PI);
+    fill.position.set(-0.5, 0.35, -0.7);
     this.scene.add(fill);
-    this.scene.add(new THREE.AmbientLight(0x50607a, 0.9));
+
+    // near-white sky over a warm earth bounce
+    this.scene.add(new THREE.HemisphereLight(0xf2eede, 0x9c8347, 0.4 * PI));
   }
 
   /* ---------------- terrain ---------------- */
@@ -156,9 +228,13 @@ export class Renderer {
         const h10 = heights[ty * (s + 1) + tx + 1];
         const h01 = heights[(ty + 1) * (s + 1) + tx];
         const h11 = heights[(ty + 1) * (s + 1) + tx + 1];
+        // Counter-clockwise seen from above, so the face normal comes out as
+        // +Y. Winding these the other way makes every ground triangle
+        // back-facing to an overhead camera: three culls the lot and the entire
+        // map renders as empty space with only the water plane showing through.
         const quad = [
-          [tx, h00, ty], [tx + 1, h10, ty], [tx + 1, h11, ty + 1],
-          [tx, h00, ty], [tx + 1, h11, ty + 1], [tx, h01, ty + 1],
+          [tx, h00, ty], [tx + 1, h11, ty + 1], [tx + 1, h10, ty],
+          [tx, h00, ty], [tx, h01, ty + 1], [tx + 1, h11, ty + 1],
         ];
         // face normal from the first triangle
         const ax = quad[1][0] - quad[0][0], ay = quad[1][1] - quad[0][1], az = quad[1][2] - quad[0][2];
@@ -185,26 +261,54 @@ export class Renderer {
     this.fogTex.needsUpdate = true;
     this.fogTex.minFilter = THREE.LinearFilter;
     this.fogTex.magFilter = THREE.LinearFilter;
+    // One byte per texel, so rows are not padded to a 4-byte boundary. Without
+    // this a map whose width is not a multiple of 4 (e.g. the 150-tile Large
+    // map) reads its fog rows progressively skewed.
+    this.fogTex.unpackAlignment = 1;
 
+    // Terrain uses a completely stock material. An earlier version patched the
+    // fog-of-war lookup into this shader via onBeforeCompile; if that injection
+    // fails to compile, three drops the material and the ENTIRE ground vanishes,
+    // leaving only the water plane visible. Fog is therefore drawn as a separate
+    // overlay below, so a shader problem can only ever cost the fog, never the
+    // terrain itself.
     const mat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
-    mat.onBeforeCompile = (shader) => {
-      shader.uniforms.fogTex = { value: this.fogTex };
-      shader.uniforms.mapSize = { value: s };
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec2 vTerrainXZ;')
-        .replace('#include <begin_vertex>',
-          '#include <begin_vertex>\nvTerrainXZ = (modelMatrix * vec4(position,1.0)).xz;');
-      shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>',
-          '#include <common>\nuniform sampler2D fogTex;\nuniform float mapSize;\nvarying vec2 vTerrainXZ;')
-        .replace('#include <dithering_fragment>',
-          `#include <dithering_fragment>
-           float fw = texture2D(fogTex, vTerrainXZ / mapSize).r;
-           gl_FragColor.rgb *= mix(0.06, 1.0, fw);`);
-    };
     this.terrain = new THREE.Mesh(geo, mat);
     this.terrain.frustumCulled = false;
     this.scene.add(this.terrain);
+
+    // Fog overlay: the same geometry, lifted a hair, painted black with alpha
+    // taken from the fog texture. Self-contained shader, no chunk injection.
+    const fogMat = new THREE.ShaderMaterial({
+      uniforms: {
+        fogTex: { value: this.fogTex },
+        mapSize: { value: s },
+      },
+      vertexShader: `
+        varying vec2 vXZ;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vXZ = wp.xz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D fogTex;
+        uniform float mapSize;
+        varying vec2 vXZ;
+        void main() {
+          float f = texture2D(fogTex, vXZ / mapSize).r;
+          gl_FragColor = vec4(0.02, 0.02, 0.05, (1.0 - f) * 0.94);
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+    });
+    this.fogOverlay = new THREE.Mesh(geo, fogMat);
+    this.fogOverlay.position.y = 0.02;
+    this.fogOverlay.frustumCulled = false;
+    this.fogOverlay.renderOrder = 3;
+    this.scene.add(this.fogOverlay);
   }
 
   _buildWater() {
@@ -213,7 +317,7 @@ export class Renderer {
     const geo = new THREE.PlaneGeometry(s, s, 1, 1);
     geo.rotateX(-Math.PI / 2);
     const mat = new THREE.MeshLambertMaterial({
-      color: 0x2c6188, transparent: true, opacity: 0.72, depthWrite: false,
+      color: 0x3a7fa8, transparent: true, opacity: 0.62, depthWrite: false,
     });
     this.water = new THREE.Mesh(geo, mat);
     this.water.position.set(s / 2, -0.14, s / 2);
@@ -225,9 +329,13 @@ export class Renderer {
     const s = this.game.size;
     const src = player.fog;
     const dst = this.fogData;
+    // 255 = fully lit, 0 = never seen. The middle value is the "shroud": ground
+    // you have explored but cannot currently see. It has to sit far enough below
+    // fully-visible to be obvious at a glance, while staying light enough that
+    // remembered buildings and terrain are still readable.
     for (let i = 0; i < dst.length; i++) {
       const v = src[i];
-      dst[i] = v === 2 ? 255 : v === 1 ? 110 : 0;
+      dst[i] = v === 2 ? 255 : v === 1 ? 100 : 0;
     }
     this.fogTex.needsUpdate = true;
   }
@@ -271,7 +379,10 @@ export class Renderer {
       pool = { mesh, capacity: 64, used: 0 };
       this._pools.set(key, pool);
     }
-    pool.used = 0;
+    // NOTE: deliberately does NOT reset pool.used. This is called once per
+    // entity, so resetting here would zero the write cursor on every entity and
+    // only the last one of each kind would ever be drawn. The per-frame reset
+    // lives at the top of render().
     return pool;
   }
 
@@ -282,6 +393,10 @@ export class Renderer {
     const mesh = new THREE.InstancedMesh(old.geometry, old.material, cap);
     mesh.frustumCulled = false;
     mesh.count = 0;
+    // Carry over the instances already written this frame; growing happens
+    // mid-loop, so dropping them would make the first N entities of a kind
+    // flicker out on exactly the frame the pool expands.
+    mesh.instanceMatrix.array.set(old.instanceMatrix.array.subarray(0, pool.used * 16));
     this.scene.remove(old);
     old.dispose();
     this.scene.add(mesh);
@@ -289,20 +404,38 @@ export class Renderer {
     pool.capacity = cap;
   }
 
-  _addInstance(pool, x, y, z, rotY, scale, tint) {
+  /** `scaleY` may differ from `scale` so a building can grow upward out of the
+   *  ground while keeping its true footprint visible. */
+  _addInstance(pool, x, y, z, rotY, scale, scaleY) {
     if (pool.used >= pool.capacity) this._grow(pool);
     const m = this._m4;
     const s = scale ?? 1;
+    const sy = scaleY ?? s;
     const c = Math.cos(rotY), sn = Math.sin(rotY);
     m.set(
       c * s, 0, sn * s, x,
-      0, s, 0, y,
+      0, sy, 0, y,
       -sn * s, 0, c * s, z,
       0, 0, 0, 1,
     );
     pool.mesh.setMatrixAt(pool.used, m);
     pool.used++;
-    void tint;
+  }
+
+  /**
+   * Instance with a tilt as well as a heading. The geometry's origin sits at its
+   * base, so tilting rotates it about the foot — which is exactly how a tree
+   * should topple.
+   */
+  _addTiltedInstance(pool, x, y, z, rotY, tilt, scale) {
+    if (pool.used >= pool.capacity) this._grow(pool);
+    this._euler.set(tilt, rotY, 0, 'YXZ');
+    this._quat.setFromEuler(this._euler);
+    this._posV.set(x, y, z);
+    this._scaleV.set(scale, scale, scale);
+    this._m4.compose(this._posV, this._quat, this._scaleV);
+    pool.mesh.setMatrixAt(pool.used, this._m4);
+    pool.used++;
   }
 
   /* ---------------- post-processing ---------------- */
@@ -312,14 +445,20 @@ export class Renderer {
     this.rt = new THREE.WebGLRenderTarget(320, 200, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
       format: THREE.RGBAFormat, depthBuffer: true,
+      samples: 4,   // MSAA on the offscreen buffer; smooths the low-poly edges
     });
+    // The scene renders into this buffer, then a raw ShaderMaterial blits it to
+    // the canvas. A raw shader does NOT get three's automatic linear -> sRGB
+    // output conversion, so the buffer must already hold sRGB. Without this the
+    // whole game is displayed in linear space and looks like permanent night.
+    this.rt.texture.colorSpace = THREE.SRGBColorSpace;
     this.postScene = new THREE.Scene();
     this.postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     const mat = new THREE.ShaderMaterial({
       uniforms: {
         tex: { value: this.rt.texture },
-        levels: { value: 22.0 },
-        vignette: { value: 0.22 },
+        levels: { value: 64.0 },   // lower this for heavier colour banding
+        vignette: { value: 0.08 },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -353,6 +492,12 @@ export class Renderer {
     this._v3 = new THREE.Vector3();
     this._ray = new THREE.Raycaster();
     this._plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    this._ndc = new THREE.Vector2();
+    this._hit = new THREE.Vector3();
+    this._euler = new THREE.Euler();
+    this._quat = new THREE.Quaternion();
+    this._posV = new THREE.Vector3();
+    this._scaleV = new THREE.Vector3();
 
     // selection ring geometry (flat annulus)
     const ring = new THREE.RingGeometry(0.42, 0.52, 16);
@@ -406,14 +551,19 @@ export class Renderer {
 
   /* ---------------- picking ---------------- */
 
+  /**
+   * Screen pixel -> world tile, via the ground plane rather than a raycast
+   * against the terrain mesh. The terrain is ~29k triangles and this runs
+   * several times per frame (cursor + minimap viewport box), so intersecting
+   * the flat plane is the difference between smooth and stuttering. Elevation
+   * only spans half a tile, so the error is well under a tile.
+   */
   screenToWorld(sx, sy) {
-    const THREE = this.THREE;
-    const ndc = new THREE.Vector2((sx / this.viewW) * 2 - 1, -(sy / this.viewH) * 2 + 1);
-    this._ray.setFromCamera(ndc, this.camera);
-    const hits = this._ray.intersectObject(this.terrain, false);
-    if (hits.length) return { x: hits[0].point.x, y: hits[0].point.z };
-    const out = new THREE.Vector3();
-    if (this._ray.ray.intersectPlane(this._plane, out)) return { x: out.x, y: out.z };
+    this._ndc.set((sx / this.viewW) * 2 - 1, -(sy / this.viewH) * 2 + 1);
+    this._ray.setFromCamera(this._ndc, this.camera);
+    if (this._ray.ray.intersectPlane(this._plane, this._hit)) {
+      return { x: this._hit.x, y: this._hit.z };
+    }
     return null;
   }
 
@@ -460,6 +610,21 @@ export class Renderer {
       }
     }
 
+    // --- felled trees: replay the topple where the tree used to stand ---
+    for (const fx of g.effects) {
+      if (fx.type !== 'treeFall') continue;
+      if (!reveal && !viewPlayer.hasExplored(fx.x | 0, fx.y | 0)) continue;
+      const k = Math.min(1, fx.t / TREE_FALL_TIME);
+      // accelerate into the fall, then settle flat
+      const tilt = Math.min(1, k * k * 1.08) * (Math.PI / 2);
+      const geoKey = fx.variant === 3 ? 'treeDry' : 'tree';
+      const poolKey = 'res:' + geoKey;
+      const pool = this._pool(poolKey, this.geoms.resources[geoKey], null);
+      usedKeys.add(poolKey);
+      this._addTiltedInstance(pool, fx.x, this.heightAt(fx.x, fx.y), fx.y,
+        fx.angle || 0, tilt, 1 - k * 0.12);
+    }
+
     // --- buildings ---
     for (const e of g.entities) {
       if (!e.alive || e.kind !== 'building') continue;
@@ -471,16 +636,45 @@ export class Renderer {
       usedKeys.add(poolKey);
       const h = this.heightAt(e.x, e.y);
       const scale = e.size;
-      // under-construction buildings rise out of the ground
-      const grow = e.complete ? 1 : 0.15 + 0.85 * (e.buildProgress / e.def.time);
-      this._addInstance(pool, e.x, h, e.y, 0, scale * (e.def.wall || e.def.gate ? 1 : 1) * grow);
+
+      if (e.complete) {
+        this._addInstance(pool, e.x, h, e.y, 0, scale);
+
+        // Flag your own farms that nobody is working, so an idle plot is
+        // obvious without hunting for it.
+        if (e.owner === viewPlayer.index && e.def.farmFood && e.farmFood > 0 &&
+            !g._farmWorker(e)) {
+          const mKey = 'misc:idleMarker';
+          const mPool = this._pool(mKey, this.geoms.misc.idleMarker, null);
+          usedKeys.add(mKey);
+          const bob = Math.sin(g.time * 2.5 + e.id) * 0.12;
+          this._addInstance(mPool, e.x, h + e.size * 0.5 + 0.9 + bob, e.y, g.time * 1.5, 1.1);
+        }
+      } else {
+        // A construction site lays a visible foundation at the building's true
+        // footprint, then the structure grows upward out of it. Scaling only Y
+        // (rather than uniformly) means the plot stays the right size on the
+        // ground from the moment it is placed, so you can always see where it is.
+        const fKey = 'misc:foundation';
+        const fPool = this._pool(fKey, this.geoms.misc.foundation, null);
+        usedKeys.add(fKey);
+        this._addInstance(fPool, e.x, h, e.y, 0, scale);
+
+        const sKey = 'misc:scaffold';
+        const sPool = this._pool(sKey, this.geoms.misc.scaffold, null);
+        usedKeys.add(sKey);
+        this._addInstance(sPool, e.x, h + 0.1, e.y, 0, scale, scale * 0.55);
+
+        const grow = Math.max(0.04, e.buildProgress / e.def.time);
+        this._addInstance(pool, e.x, h + 0.12, e.y, 0, scale, scale * grow);
+      }
     }
 
     // --- units ---
     for (const e of g.entities) {
       if (!e.alive || e.kind !== 'unit' || e.garrisonedIn) continue;
       if (!reveal && !viewPlayer.canSee(e.x | 0, e.y | 0)) continue;
-      const key = unitMeshKey(e.def);
+      const key = unitMeshKeyFor(e);
       const owner = e.owner < 0 ? 6 : e.owner;
       const color = e.owner < 0 ? 0x9a8f7a : PLAYER_COLORS[owner % PLAYER_COLORS.length];
       const poolKey = `unit:${key}:${e.owner}`;
@@ -517,6 +711,7 @@ export class Renderer {
     let fc = 0;
     for (const fx of g.effects) {
       if (fc >= 256) break;
+      if (fx.type === 'treeFall') continue;   // drawn as real geometry above
       if (!reveal && !viewPlayer.canSee(fx.x | 0, fx.y | 0)) continue;
       const life = fx.type === 'explosion' ? 0.5 : 0.28;
       if (fx.t > life) continue;

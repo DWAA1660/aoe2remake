@@ -21,10 +21,13 @@ export class Overlay {
     this.canvas.height = window.innerHeight;
   }
 
-  pushMoveMarker(x, y) {
-    this.markers.push({ x, y, t: 0 });
-    if (this.markers.length > 24) this.markers.shift();
+  pushMarker(x, y, kind = 'move', queued = false) {
+    this.markers.push({ x, y, kind, queued, t: 0 });
+    if (this.markers.length > 32) this.markers.shift();
   }
+
+  // kept for older call sites
+  pushMoveMarker(x, y) { this.pushMarker(x, y, 'move', false); }
 
   draw(dt, selection, viewPlayer) {
     const g = this.g;
@@ -90,19 +93,134 @@ export class Overlay {
       }
     }
 
-    // click markers
+    this._drawOrderQueues(selection);
+
+    // click markers - a brief expanding ring in the colour of the command
     for (let i = this.markers.length - 1; i >= 0; i--) {
       const m = this.markers[i];
       m.t += dt;
-      if (m.t > 0.6) { this.markers.splice(i, 1); continue; }
+      const life = 0.6;
+      if (m.t > life) { this.markers.splice(i, 1); continue; }
       const p = r.worldToScreen(m.x, r.heightAt(m.x, m.y) + 0.1, m.y);
       if (p.z > 1) continue;
-      const k = 1 - m.t / 0.6;
-      g.strokeStyle = `rgba(120,255,120,${k})`;
-      g.lineWidth = 2;
+      const k = 1 - m.t / life;
+      const [cr, cg, cb] = KIND_RGB[m.kind] || KIND_RGB.move;
+      g.strokeStyle = `rgba(${cr},${cg},${cb},${k})`;
+      g.lineWidth = m.queued ? 1.5 : 2.5;
       g.beginPath();
       g.arc(p.x, p.y, 4 + (1 - k) * 14, 0, Math.PI * 2);
       g.stroke();
     }
   }
+
+  /* ---------------- shift-queue visualisation ---------------- */
+
+  _orderPoint(o) {
+    if (o.x !== undefined && o.y !== undefined) return { x: o.x, y: o.y };
+    const t = this.game.byId.get(o.targetId);
+    return t && t.alive ? { x: t.x, y: t.y } : null;
+  }
+
+  _taskPoint(task) {
+    if (!task) return null;
+    if (task.type === 'idle') return null;
+    if (task.x !== undefined && task.y !== undefined) return { x: task.x, y: task.y };
+    if (task.bx !== undefined) return { x: task.bx, y: task.by };
+    if (task.targetId) {
+      const t = this.game.byId.get(task.targetId);
+      if (t && t.alive) return { x: t.x, y: t.y };
+    }
+    return null;
+  }
+
+  /**
+   * Draws the pending order chain for the selected units: a thin line from the
+   * unit through each waypoint, with numbered, colour-coded markers so the
+   * player can read a long shift-queue at a glance.
+   */
+  _drawOrderQueues(selection) {
+    const g = this.g;
+    const r = this.renderer;
+    let drawn = 0;
+    for (const u of selection) {
+      if (drawn >= 12) break;
+      if (!u.alive || u.kind !== 'unit') continue;
+      const orders = u.orders || [];
+      const first = this._taskPoint(u.task);
+      if (!orders.length && !first) continue;
+      drawn++;
+
+      const pts = [];
+      if (first) pts.push({ p: first, kind: taskKind(u.task) });
+      for (const o of orders) {
+        const p = this._orderPoint(o);
+        if (p) pts.push({ p, kind: o.type });
+      }
+      if (!pts.length) continue;
+
+      // connecting line, starting at the unit itself
+      const screen = [r.worldToScreen(u.x, r.heightAt(u.x, u.y) + 0.3, u.y)];
+      for (const s of pts) screen.push(r.worldToScreen(s.p.x, r.heightAt(s.p.x, s.p.y) + 0.15, s.p.y));
+
+      g.save();
+      g.setLineDash([4, 4]);
+      g.strokeStyle = 'rgba(230,230,200,0.42)';
+      g.lineWidth = 1;
+      g.beginPath();
+      g.moveTo(screen[0].x, screen[0].y);
+      for (let i = 1; i < screen.length; i++) g.lineTo(screen[i].x, screen[i].y);
+      g.stroke();
+      g.restore();
+
+      // numbered waypoint markers (the live task is 0 and drawn unnumbered)
+      for (let i = 0; i < pts.length; i++) {
+        const s = screen[i + 1];
+        if (!s || s.z > 1) continue;
+        const [cr, cg, cb] = KIND_RGB[pts[i].kind] || KIND_RGB.move;
+        const rad = i === 0 ? 6 : 7;
+        g.fillStyle = `rgba(${cr},${cg},${cb},0.85)`;
+        g.strokeStyle = 'rgba(0,0,0,0.75)';
+        g.lineWidth = 1.5;
+        g.beginPath();
+        g.arc(s.x, s.y, rad, 0, Math.PI * 2);
+        g.fill();
+        g.stroke();
+        if (i > 0) {
+          g.fillStyle = '#101014';
+          g.font = 'bold 9px monospace';
+          g.textAlign = 'center';
+          g.textBaseline = 'middle';
+          g.fillText(String(i), s.x, s.y + 0.5);
+          g.textAlign = 'left';
+          g.textBaseline = 'alphabetic';
+        }
+      }
+    }
+  }
+}
+
+// Command colours, shared by the click markers and the queue waypoints.
+const KIND_RGB = {
+  move: [120, 255, 120],
+  attackMove: [255, 150, 90],
+  attack: [255, 90, 80],
+  patrol: [190, 130, 255],
+  gather: [230, 210, 120],
+  food: [225, 105, 90],
+  wood: [190, 135, 70],
+  gold: [230, 195, 70],
+  stone: [190, 190, 180],
+  build: [110, 180, 240],
+  repair: [255, 180, 90],
+  garrison: [120, 220, 220],
+  heal: [240, 240, 240],
+  relic: [255, 255, 200],
+  trade: [230, 200, 120],
+};
+
+function taskKind(task) {
+  if (!task) return 'move';
+  if (task.type === 'gather' || task.type === 'deliver') return task.resType || 'gather';
+  if (task.type === 'convert') return 'attack';
+  return task.type;
 }

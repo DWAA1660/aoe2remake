@@ -1,6 +1,6 @@
 // Damage resolution. All of the counter system lives here plus data/armor.js.
 
-import { computeDamage, explainDamage } from '../data/armor.js';
+import { computeDamage, explainDamage, zeroArmorFor } from '../data/armor.js';
 
 /** Effective armor table for an entity, including civ/tech modifiers. */
 export function armorOf(ent) {
@@ -28,7 +28,7 @@ export function resolveDamage(game, attacker, target, attackTable, opts = {}) {
   const ignoresArmor = attacker?.def?.ignoreArmor ||
     (atkPlayer && atkPlayer.mods.flags.has('wootzSteel') &&
       (attacker.def.cat === 'infantry' || attacker.def.cat === 'cavalry'));
-  if (ignoresArmor) armor = ZERO_ARMOR;
+  if (ignoresArmor) armor = zeroArmorFor(target);
 
   // Sicilians: land military units take 33% less bonus damage
   if (defPlayer && defPlayer.mods.flags.has('bonusResist') && target.kind === 'unit') {
@@ -65,10 +65,17 @@ export function resolveDamage(game, attacker, target, attackTable, opts = {}) {
   if (opts.scale) dmg = Math.max(1, Math.round(dmg * opts.scale));
 
   applyDamage(game, target, dmg, attacker);
+
+  // Villagers fight back against wolves and boar rather than being eaten while
+  // they keep chopping, which is what AoE2 villagers do.
+  if (attacker && attacker.owner < 0 && target.kind === 'unit' &&
+      target.def.cat === 'villager' && target.alive &&
+      target.task.type !== 'attack' && target.task.type !== 'deliver') {
+    target.task = { type: 'attack', targetId: attacker.id, auto: true, homeX: target.x, homeY: target.y };
+    target.path = null;
+  }
   return dmg;
 }
-
-const ZERO_ARMOR = { melee: 0, pierce: 0 };
 
 export function applyDamage(game, target, dmg, attacker) {
   if (!target.alive) return;

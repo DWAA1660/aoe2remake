@@ -1,4 +1,4 @@
-// Building database (AoE2:DE costs / HP / footprints).
+﻿// Building database (AoE2:DE costs / HP / footprints).
 //
 // size      : footprint in tiles (square)
 // dropSite  : resources villagers can deposit here
@@ -36,6 +36,10 @@ function B(id, def) {
   b.cost = { food: 0, wood: 0, gold: 0, stone: 0, ...(def.cost || {}) };
   b.armor = { melee: 0, pierce: 7, ...(def.armor || {}) };
   if (def.bonus && b.atk) b.atk = { ...b.atk, ...def.bonus };
+  // See units.js: an explicit (0) armor entry is what marks class membership.
+  // Each building belongs to exactly one of building / stoneDefense / wall so
+  // siege bonus components are never counted twice.
+  for (const c of b.classes) if (b.armor[c] === undefined) b.armor[c] = 0;
   DB[id] = b;
   return b;
 }
@@ -45,7 +49,7 @@ function B(id, def) {
 B('townCenter', {
   name: 'Town Center', cat: 'economy', age: 'dark',
   cost: { wood: 275, stone: 100 }, time: 150, hp: 2400, size: 4,
-  armor: { melee: 3, pierce: 5 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 3, pierce: 5 }, classes: ['stoneDefense'],
   atk: { pierce: 5 }, range: 6, reload: 2.0, los: 12,
   garrison: 15, arrowsPerGarrison: 1, baseArrows: 0,
   dropSite: ['food', 'wood', 'gold', 'stone'], pop: 5,
@@ -173,7 +177,7 @@ B('university', {
 B('castle', {
   name: 'Castle', cat: 'military', age: 'castle',
   cost: { stone: 650 }, time: 200, hp: 4800, size: 4,
-  armor: { melee: 8, pierce: 11 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 8, pierce: 11 }, classes: ['stoneDefense'],
   atk: { pierce: 11 }, bonus: { ship: 7 }, range: 8, reload: 2.0, los: 11,
   garrison: 20, arrowsPerGarrison: 1, baseArrows: 5,
   trains: ['trebuchet', 'petard'],   // + civ unique unit, injected at runtime
@@ -190,28 +194,28 @@ B('outpost', {
 B('watchTower', {
   name: 'Watch Tower', cat: 'defense', age: 'feudal',
   cost: { wood: 50, stone: 125 }, time: 80, hp: 1020, size: 1,
-  armor: { melee: 0, pierce: 7 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 0, pierce: 7 }, classes: ['stoneDefense'],
   atk: { pierce: 5 }, bonus: { ship: 4 }, range: 8, reload: 2.0, los: 10,
   garrison: 5, arrowsPerGarrison: 1, baseArrows: 1, upgradeTo: 'guardTower',
 });
 B('guardTower', {
   name: 'Guard Tower', cat: 'defense', age: 'castle',
   cost: { wood: 50, stone: 125 }, time: 80, hp: 1500, size: 1,
-  armor: { melee: 1, pierce: 7 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 1, pierce: 7 }, classes: ['stoneDefense'],
   atk: { pierce: 7 }, bonus: { ship: 5 }, range: 8, reload: 2.0, los: 10,
   garrison: 5, arrowsPerGarrison: 1, baseArrows: 1, upgradeTo: 'keep',
 });
 B('keep', {
   name: 'Keep', cat: 'defense', age: 'imperial',
   cost: { wood: 50, stone: 125 }, time: 80, hp: 2250, size: 1,
-  armor: { melee: 3, pierce: 8 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 3, pierce: 8 }, classes: ['stoneDefense'],
   atk: { pierce: 11 }, bonus: { ship: 6 }, range: 8, reload: 2.0, los: 11,
   garrison: 5, arrowsPerGarrison: 1, baseArrows: 1,
 });
 B('bombardTower', {
   name: 'Bombard Tower', cat: 'defense', age: 'imperial',
   cost: { stone: 125, gold: 100 }, time: 80, hp: 2220, size: 1,
-  armor: { melee: 3, pierce: 9 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 3, pierce: 9 }, classes: ['stoneDefense'],
   atk: { pierce: 40 }, bonus: { ship: 40, building: 200 }, range: 8, minRange: 0,
   reload: 4.0, los: 12, blast: 0.5,
   garrison: 5, arrowsPerGarrison: 1, baseArrows: 1,
@@ -220,23 +224,23 @@ B('bombardTower', {
 B('palisadeWall', {
   name: 'Palisade Wall', cat: 'defense', age: 'dark',
   cost: { wood: 2 }, time: 6, hp: 250, size: 1,
-  armor: { melee: 2, pierce: 5 }, classes: ['building', 'wall'], los: 2, wall: true,
+  armor: { melee: 2, pierce: 5 }, classes: ['wall'], los: 2, wall: true,
 });
 B('stoneWall', {
   name: 'Stone Wall', cat: 'defense', age: 'feudal',
   cost: { stone: 5 }, time: 8, hp: 1800, size: 1,
-  armor: { melee: 8, pierce: 10 }, classes: ['building', 'wall', 'stoneDefense'], los: 2, wall: true,
+  armor: { melee: 8, pierce: 10 }, classes: ['wall'], los: 2, wall: true,
   upgradeTo: 'fortifiedWall',
 });
 B('fortifiedWall', {
   name: 'Fortified Wall', cat: 'defense', age: 'castle',
   cost: { stone: 5 }, time: 8, hp: 3000, size: 1,
-  armor: { melee: 8, pierce: 12 }, classes: ['building', 'wall', 'stoneDefense'], los: 2, wall: true,
+  armor: { melee: 8, pierce: 12 }, classes: ['wall'], los: 2, wall: true,
 });
 B('gate', {
   name: 'Gate', cat: 'defense', age: 'feudal',
   cost: { stone: 30 }, time: 70, hp: 2750, size: 1,
-  armor: { melee: 8, pierce: 10 }, classes: ['building', 'wall', 'stoneDefense'], los: 6, gate: true,
+  armor: { melee: 8, pierce: 10 }, classes: ['wall'], los: 6, gate: true,
 });
 
 /* ---------------- Wonder + civ-unique buildings ---------------- */
@@ -250,7 +254,7 @@ B('wonder', {
 B('donjon', {
   name: 'Donjon', cat: 'defense', age: 'dark', unique: 'sicilians',
   cost: { wood: 75, stone: 175 }, time: 83, hp: 1800, size: 2,
-  armor: { melee: 2, pierce: 8 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 2, pierce: 8 }, classes: ['stoneDefense'],
   atk: { pierce: 6 }, range: 8, reload: 2.0, los: 10,
   garrison: 10, arrowsPerGarrison: 1, baseArrows: 2,
   trains: ['serjeant', 'eliteSerjeant'],
@@ -259,7 +263,7 @@ B('donjon', {
 B('krepost', {
   name: 'Krepost', cat: 'defense', age: 'castle', unique: 'bulgarians',
   cost: { stone: 300 }, time: 60, hp: 2500, size: 3,
-  armor: { melee: 8, pierce: 11 }, classes: ['building', 'stoneDefense'],
+  armor: { melee: 8, pierce: 11 }, classes: ['stoneDefense'],
   atk: { pierce: 7 }, range: 7, reload: 2.0, los: 9,
   garrison: 10, arrowsPerGarrison: 1, baseArrows: 3,
   trains: ['konnik', 'eliteKonnik'],
@@ -297,3 +301,4 @@ export const BUILD_MENU = {
     'stable', 'blacksmith', 'market', 'monastery', 'university', 'siegeWorkshop', 'castle',
     'watchTower', 'bombardTower', 'outpost', 'stoneWall', 'gate', 'townCenter', 'wonder'],
 };
+

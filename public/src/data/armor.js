@@ -52,11 +52,24 @@ export function computeDamage(attack, armor) {
   for (const cls in attack) {
     const a = attack[cls];
     if (!a) continue;
-    const def = armor[cls] || 0;
+    // A damage component only lands if the target actually BELONGS to that
+    // armor class. Every unit carries an explicit (usually 0) armor entry for
+    // each class it belongs to; an absent entry means "not that class", so a
+    // Halberdier's +26 cavalry does nothing to another Halberdier.
+    const def = armor[cls];
+    if (def === undefined) continue;
     const d = a - def;
     if (d > 0) total += d;
   }
   return Math.max(1, total);
+}
+
+/** Zero-armor table matching a target's classes, for armour-ignoring attacks. */
+export function zeroArmorFor(target) {
+  const out = { melee: 0, pierce: 0 };
+  const classes = target?.def?.classes;
+  if (classes) for (const c of classes) out[c] = 0;
+  return out;
 }
 
 /**
@@ -69,7 +82,8 @@ export function explainDamage(attack, armor) {
   for (const cls in attack) {
     const a = attack[cls];
     if (!a) continue;
-    const def = armor[cls] || 0;
+    const def = armor[cls];
+    if (def === undefined) continue;
     const d = Math.max(0, a - def);
     total += d;
     parts.push({ cls, attack: a, armor: def, dealt: d });
