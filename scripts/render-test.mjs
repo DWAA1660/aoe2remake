@@ -584,6 +584,168 @@ async function main() {
         tasks: vills.map((v) => v.task.type),
       };
     });
+    /* ---- several villagers on ONE farm: extras must go make their own ---- */
+    const shareFarm = await page.evaluate(async () => {
+      const g = window.__game, pl = g.players[0];
+      pl.res.wood = 5000; pl.res.food = 5000;
+      const mill = g.entities.find((e) => e.alive && e.type === 'mill' && e.owner === 0);
+      if (!mill) return { error: 'no mill' };
+
+      // one plot, four villagers all told to build it
+      let spot = g._nearestFarmSpot(mill, 0, []);
+      if (!spot) return { error: 'no room' };
+      pl.spend(pl.mods.building('farm').cost);
+      const farm = g.placeBuilding('farm', 0, spot.x, spot.y, false);
+
+      const vills = [];
+      for (let i = 0; i < 4; i++) vills.push(g.spawnUnit('villager', 0, mill.x, mill.y));
+      g.commandBuildAt(vills, farm, false);
+
+      // wait for it to finish and the follow-up work to be handed out
+      let waited = 0;
+      while (waited < 40000 && !farm.complete) {
+        await new Promise((r) => setTimeout(r, 250)); waited += 250;
+      }
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const tasks = vills.map((v) => v.task.type);
+      const idle = tasks.filter((t) => t === 'idle').length;
+      const farming = vills.filter((v) => {
+        const t = v.task.type === 'gather' ? g.byId.get(v.task.targetId) : null;
+        return t && g._isFarm(t);
+      }).length;
+      const buildingFarms = vills.filter((v) => {
+        const t = v.task.type === 'build' ? g.byId.get(v.task.targetId) : null;
+        return t && g._isFarm(t);
+      }).length;
+      const plots = g.entities.filter((e) => e.alive && g._isFarm(e) && e.owner === 0).length;
+      return { completed: farm.complete, tasks, idle, farming, buildingFarms, plots };
+    });
+    console.log('\n== several villagers, one farm ==');
+    if (shareFarm.error) console.log('  ' + shareFarm.error);
+    else {
+      console.log(`  farm completed       ${shareFarm.completed}`);
+      console.log(`  villager tasks       ${JSON.stringify(shareFarm.tasks)}`);
+      console.log(`  now farming          ${shareFarm.farming}`);
+      console.log(`  now building a farm  ${shareFarm.buildingFarms}`);
+      console.log(`  left idle            ${shareFarm.idle}`);
+      if (shareFarm.completed && shareFarm.idle > 0) {
+        problemsExtra.push(`${shareFarm.idle} villagers left idle after sharing a farm`);
+      }
+      if (shareFarm.completed && shareFarm.farming < 1) {
+        problemsExtra.push('nobody started farming the completed plot');
+      }
+    }
+
+    /* ---- Farm build-mode + shift-click the Mill = queue plots one per click ---- */
+    const snap = await page.evaluate(() => {
+      const c = window.__ctx, g = window.__game, pl = g.players[0];
+      pl.res.wood = 5000;
+      const mill = g.entities.find((e) => e.alive && e.type === 'mill' && e.owner === 0);
+      if (!mill) return { error: 'no mill' };
+      const vills = [];
+      for (let i = 0; i < 4; i++) vills.push(g.spawnUnit('villager', 0, mill.x + 1, mill.y + 1));
+      c.input.setSelection(vills);
+      c.renderer.centerOn(mill.x, mill.y);
+      c.renderer.render(pl, []);
+      const scr = c.renderer.worldToScreen(mill.x, c.renderer.heightAt(mill.x, mill.y), mill.y);
+      c.input.mouse.x = scr.x; c.input.mouse.y = scr.y;
+
+      // pick Farm from the build menu, then hover the Mill WITHOUT shift
+      c.input.startPlacement('farm');
+      c.input._updatePlacement();
+      const withoutShift = { tx: c.input.placement.tx, ty: c.input.placement.ty,
+        valid: c.input.placement.valid, snapped: !!c.input.placement.snappedTo };
+
+      // now hold shift - the ghost should jump off the Mill to a legal plot
+      c.input.keys.add('ShiftLeft');
+      c.input._updatePlacement();
+      const withShift = { tx: c.input.placement.tx, ty: c.input.placement.ty,
+        valid: c.input.placement.valid, snapped: !!c.input.placement.snappedTo };
+
+      // click repeatedly with shift held: each should add one more farm
+      const before = g.entities.filter((e) => e.alive && g._isFarm(e)).length;
+      const spots = [];
+      for (let i = 0; i < 5; i++) {
+        c.input._placeBuilding(true);
+        if (c.input.placement) spots.push(`${c.input.placement.tx},${c.input.placement.ty}`);
+      }
+      const after = g.entities.filter((e) => e.alive && g._isFarm(e)).length;
+      const builders = vills.filter((v) => v.task.type === 'build').length;
+      const distinctTargets = new Set(vills.map((v) => v.task.targetId)).size;
+      const stillPlacing = !!c.input.placement;
+      c.input.cancelPlacement();
+      c.input.keys.delete('ShiftLeft');
+      return { withoutShift, withShift, created: after - before, builders,
+        distinctTargets, stillPlacing, spots };
+    });
+    console.log('\n== Farm build-mode + shift over the Mill ==');
+    if (snap.error) console.log('  ' + snap.error);
+    else {
+      console.log(`  ghost without shift  ${snap.withoutShift.tx},${snap.withoutShift.ty} valid=${snap.withoutShift.valid} snapped=${snap.withoutShift.snapped}`);
+      console.log(`  ghost with shift     ${snap.withShift.tx},${snap.withShift.ty} valid=${snap.withShift.valid} snapped=${snap.withShift.snapped}`);
+      console.log(`  farms from 5 clicks  ${snap.created}`);
+      console.log(`  villagers building   ${snap.builders} on ${snap.distinctTargets} distinct plots`);
+      console.log(`  still in place mode  ${snap.stillPlacing}`);
+      if (!snap.withShift.snapped) problemsExtra.push('shift did not snap the farm ghost to the Mill');
+      if (!snap.withShift.valid) problemsExtra.push('snapped farm position was not valid');
+      if (snap.created < 5) problemsExtra.push(`5 shift-clicks produced only ${snap.created} farms`);
+      if (!snap.stillPlacing) problemsExtra.push('placement mode ended, cannot keep clicking');
+    }
+
+    /* ---- the hover preview must match what the click actually builds ---- */
+    const preview = await page.evaluate(() => {
+      const c = window.__ctx, g = window.__game, pl = g.players[0];
+      pl.res.wood = 5000;
+      const mill = g.entities.find((e) => e.alive && e.type === 'mill' && e.owner === 0);
+      if (!mill) return { error: 'no mill' };
+      const vills = [];
+      for (let i = 0; i < 5; i++) vills.push(g.spawnUnit('villager', 0, mill.x + 1, mill.y + 1));
+      c.input.setSelection(vills);
+      c.renderer.centerOn(mill.x, mill.y);
+      c.renderer.render(pl, []);
+
+      const scr = c.renderer.worldToScreen(mill.x, c.renderer.heightAt(mill.x, mill.y), mill.y);
+      c.input.mouse.x = scr.x; c.input.mouse.y = scr.y;
+      c.input.keys.add('ShiftLeft');
+      c.input._previewKey = null;
+      c.input.updateFarmPreview();
+      const shown = (c.renderer.farmPreview || []).map((p) => `${p.tx},${p.ty}${p.reuse ? 'R' : ''}`);
+      // pads are created during a draw, so render once before counting them
+      c.renderer.render(pl, c.input.selection);
+      const padsVisible = (c.renderer._previewPads || []).filter((p) => p.visible).length;
+
+      // now actually do it and compare
+      const beforeIds = new Set(g.entities.filter((e) => g._isFarm(e)).map((e) => e.id));
+      c.input._tryMassFarm({ x: scr.x, y: scr.y });
+      const built = g.entities.filter((e) => e.alive && g._isFarm(e) && !beforeIds.has(e.id))
+        .map((e) => `${e.tx},${e.ty}`);
+      const reused = shown.filter((s) => s.endsWith('R')).length;
+
+      c.input.keys.delete('ShiftLeft');
+      c.input._previewKey = null;
+      c.input.updateFarmPreview();
+      const clearedOnRelease = c.renderer.farmPreview === null;
+
+      const newShown = shown.filter((s) => !s.endsWith('R'));
+      const match = newShown.length === built.length &&
+        newShown.every((s) => built.includes(s));
+      return { shown, built, reused, match, padsVisible, clearedOnRelease };
+    });
+    console.log('\n== farm placement preview ==');
+    if (preview.error) console.log('  ' + preview.error);
+    else {
+      console.log(`  preview showed   ${preview.shown.join(' ')} (${preview.reused} reused)`);
+      console.log(`  click built at   ${preview.built.join(' ')}`);
+      console.log(`  preview matched  ${preview.match}`);
+      console.log(`  pads rendered    ${preview.padsVisible}`);
+      console.log(`  cleared on shift release ${preview.clearedOnRelease}`);
+      if (!preview.shown.length) problemsExtra.push('no farm preview was produced on hover');
+      if (!preview.match) problemsExtra.push('preview did not match what the click built');
+      if (!preview.padsVisible) problemsExtra.push('preview pads were not rendered');
+      if (!preview.clearedOnRelease) problemsExtra.push('preview not cleared when shift released');
+    }
+
     console.log('\n== shift+click Mill (real input path) ==');
     if (clickFarm.error) console.log('  ' + clickFarm.error);
     else {

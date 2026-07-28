@@ -191,6 +191,84 @@ export class HUD {
     this._updateSelection(selection);
     this._updateCard(selection);
     this._drawMinimap();
+    if (this.specBar && this._frame % 10 === 0) this._updateSpectatorBar();
+  }
+
+  /* ================================================================
+   *  Spectator
+   * ================================================================ */
+
+  buildSpectatorBar() {
+    const root = document.getElementById('hud');
+    this.specBar = el('div', 'specbar');
+
+    const controls = el('div', 'specctl');
+    this.specPause = el('button', 'topbtn', 'Pause');
+    this.specPause.onclick = () => {
+      const c = this.ctx;
+      c.timeScale = c.timeScale === 0 ? (c.lastScale || 1) : 0;
+      if (c.timeScale !== 0) c.lastScale = c.timeScale;
+    };
+    controls.appendChild(this.specPause);
+    for (const s of [1, 2, 4, 8]) {
+      const b = el('button', 'topbtn spd', s + '×');
+      b.onclick = () => { this.ctx.timeScale = s; this.ctx.lastScale = s; };
+      b.dataset.speed = String(s);
+      controls.appendChild(b);
+    }
+    this.specSpeedBtns = [...controls.querySelectorAll('.spd')];
+    this.specBar.appendChild(controls);
+
+    // one card per player: click it to watch that economy
+    this.specCards = this.game.players.map((p, i) => {
+      const card = el('div', 'speccard');
+      card.style.borderColor = '#' +
+        PLAYER_COLORS[i % PLAYER_COLORS.length].toString(16).padStart(6, '0');
+      card.onclick = () => this.ctx.setViewPlayer?.(i);
+      card.innerHTML = `<div class="specname">${p.name} — ${p.civ.name}</div><div class="specstats"></div>`;
+      this.specBar.appendChild(card);
+      return card;
+    });
+
+    root.appendChild(this.specBar);
+    this._updateSpectatorBar();
+  }
+
+  _updateSpectatorBar() {
+    // Counting entities every frame is wasted work for a panel that only needs
+    // to feel live, so this runs on the same 10-frame cadence as the worker
+    // counts and walks the entity list once for all players.
+    const stats = this.game.players.map(() => ({ vill: 0, army: 0, bld: 0, idle: 0 }));
+    for (const e of this.game.entities) {
+      if (!e.alive) continue;
+      const s = stats[e.owner];
+      if (!s) continue;
+      if (e.kind === 'building') { if (e.complete) s.bld++; continue; }
+      if (e.kind !== 'unit') continue;
+      if (e.def.cat === 'villager') {
+        s.vill++;
+        if (e.task.type === 'idle') s.idle++;
+      } else if (['infantry', 'cavalry', 'archer', 'siege', 'monk'].includes(e.def.cat)) s.army++;
+    }
+
+    for (let i = 0; i < this.specCards.length; i++) {
+      const p = this.game.players[i], s = stats[i];
+      const watching = i === this.playerIndex;
+      this.specCards[i].classList.toggle('watching', watching);
+      this.specCards[i].classList.toggle('dead', p.defeated);
+      this.specCards[i].querySelector('.specstats').innerHTML =
+        `<span>${AGE_NAMES[p.age]}</span>` +
+        `<span>${s.vill} vill${s.idle ? ` <b class="warn">(${s.idle} idle)</b>` : ''}</span>` +
+        `<span>${s.army} army</span>` +
+        `<span>${s.bld} bldg</span>` +
+        `<span class="dim">${Math.round(p.stats.resourcesGathered)} gathered</span>`;
+    }
+
+    const c = this.ctx;
+    this.specPause.textContent = c.timeScale === 0 ? 'Resume' : 'Pause';
+    for (const b of this.specSpeedBtns) {
+      b.classList.toggle('on', c.timeScale === Number(b.dataset.speed));
+    }
   }
 
   /** Villagers per resource + idle count, for the AoE2-style top bar. */
@@ -485,6 +563,11 @@ export class HUD {
     if (key === this._cardKey) return;
     this._cardKey = key;
     this.card.innerHTML = '';
+
+    // A spectator inspects; they do not command. Every button on this card
+    // trains, researches or places something, so the whole card goes away
+    // rather than showing controls that quietly do nothing.
+    if (this.ctx.spectator) return;
 
     const mine = sel.filter((e) => e.owner === this.playerIndex);
     if (!mine.length) return;

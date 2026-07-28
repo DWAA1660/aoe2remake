@@ -530,9 +530,18 @@ T('shipwright', {
  *  Unit line upgrades
  * ------------------------------------------------------------------ */
 
-function UPG(id, name, from, to, age, cost, time, building) {
+/**
+ * A unit-line upgrade. Researched once, it converts every unit you already own
+ * and replaces the old unit in the training list for good.
+ *
+ * `requires` is what keeps the line a line. Without it a player reaching the
+ * Imperial Age could research Champion, Paladin and Siege Ram straight away and
+ * skip everything below them, which is not how AoE2 works and removes the whole
+ * progression from the game.
+ */
+function UPG(id, name, from, to, age, cost, time, building, requires = []) {
   T(id, {
-    name, building, age, cost, time,
+    name, building, age, cost, time, requires,
     desc: `Upgrades ${from} to ${to}.`,
     effects: [{ k: 'unitUpgrade', from, to }],
   });
@@ -568,11 +577,55 @@ UPG('upHeavyScorpion', 'Heavy Scorpion', 'scorpion', 'heavyScorpion', 'imperial'
 
 // Elite unique-unit upgrades are generated per civ in data/civs.js.
 
+/* ------------------------------------------------------------------ *
+ *  Upgrade-line wiring
+ *
+ *  Both of these are derived from the effects rather than listed by hand, so a
+ *  line added later cannot silently end up skippable, and civ-generated Elite
+ *  upgrades are covered without needing to know about them here.
+ * ------------------------------------------------------------------ */
+
+let _producedBy = null;
+
+/** Which tech turns some other unit into `unitId`, if any. */
+export function upgradeTechFor(unitId) {
+  if (!_producedBy) {
+    _producedBy = new Map();
+    for (const id in DB) {
+      for (const e of DB[id].effects) {
+        if (e.k === 'unitUpgrade') _producedBy.set(e.to, id);
+      }
+    }
+  }
+  return _producedBy.get(unitId) || null;
+}
+
+/**
+ * Makes every unit-line upgrade require the one below it: Champion needs
+ * Two-Handed Swordsman, which needs Long Swordsman, which needs Man-at-Arms.
+ * Without this, reaching the Imperial Age let a player buy the top of every
+ * line immediately and skip the entire progression.
+ */
+function chainUnitUpgrades() {
+  for (const id in DB) {
+    const up = DB[id].effects.find((e) => e.k === 'unitUpgrade');
+    if (!up) continue;
+    const prev = upgradeTechFor(up.from);
+    if (prev && prev !== id && !DB[id].requires.includes(prev)) DB[id].requires.push(prev);
+  }
+}
+chainUnitUpgrades();
+
 export const TECHS = DB;
 export function getTech(id) {
   const t = DB[id];
   if (!t) throw new Error('Unknown tech: ' + id);
   return t;
 }
-export function addTech(id, def) { return T(id, def); }
+export function addTech(id, def) {
+  _producedBy = null;   // civs.js registers Elite upgrades after this module loads
+  const t = T(id, def);
+  chainUnitUpgrades();
+  return t;
+}
 export const TECH_IDS = Object.keys(DB);

@@ -2,7 +2,7 @@
 
 import { ModifierSet } from './modifiers.js';
 import { getCiv } from '../data/civs.js';
-import { TECHS } from '../data/techs.js';
+import { TECHS, upgradeTechFor } from '../data/techs.js';
 import { BUILDINGS } from '../data/buildings.js';
 
 export const AGES = ['dark', 'feudal', 'castle', 'imperial'];
@@ -92,6 +92,11 @@ export class Player {
   }
 
   get effectivePopCap() {
+    // "Need no Houses" has to mean "already at the population limit". While
+    // Houses were the only source of population it instead meant Huns were
+    // pinned at their starting cap of 10 for the whole game - they could never
+    // reach 11 pop, let alone boom.
+    if (this.mods.flags.has('noHouses')) return this.popMax;
     return Math.min(this.popMax, this.popCap + this.mods.popCapAdd);
   }
 
@@ -102,6 +107,12 @@ export class Player {
   isUnitAvailable(unitId) {
     if (this.disabledUnits.has(unitId)) return false;
     const u = this.mods.unit(unitId);
+    // A unit that only exists as the result of an upgrade cannot be trained
+    // until that upgrade is researched. Reaching the Imperial Age used to make
+    // Champions, Paladins and Hussars trainable outright, so the whole
+    // upgrade line was decoration - you simply trained the best one.
+    const via = upgradeTechFor(unitId);
+    if (via && !this.researched.has(via)) return false;
     if (u.unique) {
       // only this civ's own unique unit line is trainable
       return unitId === this.civ.uu || unitId === this.civ.uuElite;

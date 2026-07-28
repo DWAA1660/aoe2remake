@@ -81,10 +81,14 @@ export class PathGrid {
    */
   findPath(sx, sy, goal, domain = 'land', maxNodes = 9000) {
     const w = this.w, h = this.h;
-    const startX = Math.max(0, Math.min(w - 1, Math.round(sx)));
-    const startY = Math.max(0, Math.min(h - 1, Math.round(sy)));
-    const gx = Math.max(0, Math.min(w - 1, Math.round(goal.x)));
-    const gy = Math.max(0, Math.min(h - 1, Math.round(goal.y)));
+    // World coordinates sit at tile centres (x.5), so the tile containing a
+    // position is floor(pos) - Math.round(10.5) is 11, a *different* tile.
+    // Searching from the wrong start tile is how a villager standing on the
+    // shore ended up pathing as though it were already in the lake.
+    const startX = Math.max(0, Math.min(w - 1, Math.floor(sx)));
+    const startY = Math.max(0, Math.min(h - 1, Math.floor(sy)));
+    const gx = Math.max(0, Math.min(w - 1, Math.floor(goal.x)));
+    const gy = Math.max(0, Math.min(h - 1, Math.floor(goal.y)));
     const goalR = goal.radius ?? 0;
 
     if (startX === gx && startY === gy) return [];
@@ -113,7 +117,7 @@ export class PathGrid {
       if (stamp[cur.i] !== gen || cur.f - g[cur.i] < -1e-6) { /* stale */ }
       const hx = Math.abs(cur.x - gx), hy = Math.abs(cur.y - gy);
       const dist = Math.max(hx, hy);
-      if (dist <= goalR) return this._reconstruct(came, cur.i);
+      if (dist <= goalR) return this._reconstruct(came, cur.i, domain);
       if (dist < bestH) { bestH = dist; best = cur.i; }
 
       if (++expanded > maxNodes) break;
@@ -144,11 +148,11 @@ export class PathGrid {
     }
 
     // No exact route - walk as close as we managed to get.
-    if (best !== null && best !== startI) return this._reconstruct(came, best);
+    if (best !== null && best !== startI) return this._reconstruct(came, best, domain);
     return null;
   }
 
-  _reconstruct(came, endIdx) {
+  _reconstruct(came, endIdx, domain) {
     const w = this.w;
     const pts = [];
     let i = endIdx;
@@ -158,16 +162,16 @@ export class PathGrid {
     }
     pts.reverse();
     pts.shift(); // drop the tile we are standing on
-    return this._smooth(pts);
+    return this._smooth(pts, domain);
   }
 
   /** String-pulling: drop waypoints we can walk past in a straight line. */
-  _smooth(pts) {
+  _smooth(pts, domain) {
     if (pts.length < 3) return pts;
     const out = [pts[0]];
     let anchor = 0;
     for (let i = 2; i < pts.length; i++) {
-      if (!this._lineClear(pts[anchor], pts[i])) {
+      if (!this._lineClear(pts[anchor], pts[i], domain)) {
         out.push(pts[i - 1]);
         anchor = i - 1;
       }
@@ -176,20 +180,60 @@ export class PathGrid {
     return out;
   }
 
-  _lineClear(a, b) {
-    const steps = Math.ceil(Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y)) * 2);
-    for (let s = 1; s < steps; s++) {
-      const t = s / steps;
-      const x = (a.x + (b.x - a.x) * t) | 0;
-      const y = (a.y + (b.y - a.y) * t) | 0;
-      if (!this.inBounds(x, y) || this.blocked[y * this.w + x]) return false;
+  /**
+   * Is the straight line between two waypoints walkable for this domain?
+   *
+   * This used to test only `blocked`, which does not include water. A* would
+   * correctly route a villager the long way around a lake and then smoothing
+   * would delete every waypoint of that detour, because the straight line
+   * across the water contains no *blocked* tile. The villager walked into the
+   * shore, could not go further, gave up, re-pathed, and did the same thing
+   * again - marching back and forth at the water's edge forever.
+   */
+  _lineClear(a, b, domain) {
+    // Walks every tile the segment actually enters (Amanatides & Woo), instead
+    // of point-sampling it. Sampling twice per tile skips tiles the line only
+    // clips, so smoothing would happily cut the corner off a forest and hand a
+    // unit a route straight through a tree.
+    let x = Math.floor(a.x), y = Math.floor(a.y);
+    const ex = Math.floor(b.x), ey = Math.floor(b.y);
+    if (!this.isPassable(x, y, domain)) return false;
+
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const stepX = Math.sign(dx), stepY = Math.sign(dy);
+    const tDeltaX = dx !== 0 ? Math.abs(1 / dx) : Infinity;
+    const tDeltaY = dy !== 0 ? Math.abs(1 / dy) : Infinity;
+    let tMaxX = dx > 0 ? (x + 1 - a.x) / dx : dx < 0 ? (x - a.x) / dx : Infinity;
+    let tMaxY = dy > 0 ? (y + 1 - a.y) / dy : dy < 0 ? (y - a.y) / dy : Infinity;
+
+    // A segment that passes exactly through a lattice point crosses no tile
+    // interior, so a strict comparison would let it graze the corner of a tree.
+    // Units have a body and A* already refuses to squeeze between two blocked
+    // tiles diagonally, so treat a corner crossing as needing both neighbours
+    // open. The epsilon matters: the corner case arrives as two crossings a
+    // rounding error apart, not as an exact tie.
+    const EPS = 1e-9;
+    let guard = 0;
+    while ((x !== ex || y !== ey) && guard++ < 4096) {
+      if (Math.abs(tMaxX - tMaxY) < EPS) {
+        if (!this.isPassable(x + stepX, y, domain) ||
+            !this.isPassable(x, y + stepY, domain)) return false;
+        tMaxX += tDeltaX; tMaxY += tDeltaY; x += stepX; y += stepY;
+      } else if (tMaxX < tMaxY) {
+        tMaxX += tDeltaX; x += stepX;
+      } else {
+        tMaxY += tDeltaY; y += stepY;
+      }
+      if (!this.isPassable(x, y, domain)) return false;
     }
     return true;
   }
 
   /** Finds the closest passable tile to (x,y), spiralling outwards. */
   nearestOpen(x, y, domain = 'land', maxR = 12) {
-    const cx = Math.round(x), cy = Math.round(y);
+    // Floor, not round: a unit sitting at the centre of tile 10 is at x=10.5,
+    // and Math.round would send it looking at tile 11.
+    const cx = Math.floor(x), cy = Math.floor(y);
     if (this.isPassable(cx, cy, domain)) return { x: cx + 0.5, y: cy + 0.5 };
     for (let r = 1; r <= maxR; r++) {
       for (let dy = -r; dy <= r; dy++) {

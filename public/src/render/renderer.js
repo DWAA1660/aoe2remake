@@ -740,12 +740,45 @@ export class Renderer {
       this.ghost.visible = false;
     }
 
+    this._updateFarmPreview();
+
     // --- draw: scene into the low-res buffer, then upscale ---
     this.renderer.setRenderTarget(this.rt);
     this.renderer.render(this.scene, this.camera);
     this.renderer.setRenderTarget(null);
     this.renderer.render(this.postScene, this.postCamera);
     void THREE;
+  }
+
+  /**
+   * Translucent pads showing where a shift-click would drop farms.
+   * `farmPreview` is a list of { tx, ty, size, reuse } set by the input layer.
+   * Green = a new plot will be built, blue = an existing idle plot reused.
+   */
+  _updateFarmPreview() {
+    const THREE = this.THREE;
+    const list = this.farmPreview;
+    if (!this._previewPads) this._previewPads = [];
+    const need = list ? list.length : 0;
+
+    while (this._previewPads.length < need) {
+      const pad = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 0.22, 1),
+        new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.42, depthWrite: false }),
+      );
+      pad.renderOrder = 4;
+      this.scene.add(pad);
+      this._previewPads.push(pad);
+    }
+    for (let i = 0; i < this._previewPads.length; i++) {
+      const pad = this._previewPads[i];
+      if (i >= need) { pad.visible = false; continue; }
+      const p = list[i];
+      pad.visible = true;
+      pad.scale.set(p.size, 0.22, p.size);
+      pad.position.set(p.tx + p.size / 2, this.heightAt(p.tx, p.ty) + 0.14, p.ty + p.size / 2);
+      pad.material.color.setHex(p.reuse ? 0x54b8ff : 0x7cff7c);
+    }
   }
 
   _updateRings(selection) {

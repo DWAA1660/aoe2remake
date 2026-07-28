@@ -278,6 +278,40 @@ ul.keys b { color: var(--gold); }
 .menu-actions { display: flex; gap: 10px; margin-top: 18px; }
 .hint { color: var(--dim); font-size: 11px; margin-top: 12px; }
 
+/* ---------------- Play / Spectate mode switch ---------------- */
+.menu-modes { display: flex; gap: 6px; margin-bottom: 16px; }
+.modebtn {
+  background: #241d14; color: var(--dim); border: 1px solid var(--edge);
+  padding: 7px 20px; border-radius: 3px; font: inherit; font-size: 13px; cursor: pointer;
+}
+.modebtn:hover { background: #2f2618; color: var(--ink); }
+.modebtn.on {
+  background: linear-gradient(#6f5b3f, #453828); color: var(--gold);
+  border-color: var(--edge2);
+}
+.civpair { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.civpair > div { min-width: 0; }
+
+/* ---------------- spectator bar ---------------- */
+.specbar {
+  position: absolute; left: 8px; top: 44px; z-index: 12;
+  display: flex; flex-direction: column; gap: 6px; pointer-events: auto;
+}
+.specctl { display: flex; gap: 4px; }
+.specctl .topbtn.on { background: linear-gradient(#6f5b3f, #453828); color: var(--gold); }
+.speccard {
+  min-width: 230px; padding: 6px 9px; cursor: pointer;
+  background: rgba(20, 16, 10, 0.86);
+  border: 1px solid var(--edge); border-left-width: 4px; border-radius: 3px;
+}
+.speccard:hover { background: rgba(42, 35, 27, 0.92); }
+.speccard.watching { background: rgba(60, 49, 33, 0.92); box-shadow: 0 0 0 1px var(--edge2); }
+.speccard.dead { opacity: 0.45; }
+.specname { font-size: 12px; color: var(--gold); margin-bottom: 2px; }
+.specstats { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: var(--ink); }
+.specstats .dim { color: var(--dim); }
+.specstats .warn { color: #ff9a6a; }
+
 /* ---------------- loading ---------------- */
 #loading {
   position: fixed; inset: 0; z-index: 45; display: flex;

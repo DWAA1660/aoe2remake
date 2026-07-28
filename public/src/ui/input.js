@@ -1,4 +1,4 @@
-// Mouse + keyboard: selection, contextual orders, building placement, hotkeys,
+﻿// Mouse + keyboard: selection, contextual orders, building placement, hotkeys,
 // control groups and camera control.
 
 import { BUILD_MENU } from '../data/buildings.js';
@@ -34,6 +34,14 @@ export class Input {
 
   get hud() { return this.ctx.hud; }
 
+  /**
+   * True while watching an AI-vs-AI match. Selection, the camera and the
+   * minimap all stay live - the point is to inspect what the AI is doing - but
+   * every path that issues an order is blocked, so the viewer cannot quietly
+   * play for the side they are watching.
+   */
+  get spectator() { return !!this.ctx.spectator; }
+
   _bind() {
     const c = this.canvas;
     c.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -45,8 +53,16 @@ export class Input {
       this.renderer.setZoom(this.renderer.zoom * (e.deltaY > 0 ? 1.12 : 0.89));
     }, { passive: false });
     window.addEventListener('keydown', (e) => this._onKeyDown(e));
-    window.addEventListener('keyup', (e) => this.keys.delete(e.code));
-    window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('keyup', (e) => {
+      this.keys.delete(e.code);
+      // pressing/releasing Shift toggles the preview without moving the mouse
+      if (e.code.startsWith('Shift')) { this._previewKey = null; this.updateFarmPreview(); this._updatePlacement(); }
+    });
+    window.addEventListener('blur', () => {
+      this.keys.clear();
+      this._previewKey = null;
+      this.updateFarmPreview();
+    });
     document.addEventListener('mouseleave', () => { this.mouse.inWindow = false; });
     document.addEventListener('mouseenter', () => { this.mouse.inWindow = true; });
   }
@@ -89,6 +105,7 @@ export class Input {
       this.renderer.panBy(-dx * k, -dy * k);
     }
     if (this.placement) this._updatePlacement();
+    this.updateFarmPreview();
   }
 
   _onMouseUp(e) {
@@ -178,7 +195,42 @@ export class Input {
    * one reads as the feature being broken.
    * @returns true if it handled the click
    */
+  /**
+   * Live preview of a shift-click farm layout while hovering a food drop-site.
+   * Planning scans a wide area per villager, so it is throttled and only redone
+   * when something that affects the answer actually changed.
+   */
+  updateFarmPreview() {
+    const r = this.renderer;
+    const shift = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
+    if (!shift || this.placement || this.hud?.modalOpen) {
+      if (r.farmPreview) { r.farmPreview = null; this._previewKey = null; }
+      return;
+    }
+    const vills = this.selection.filter((e) =>
+      e.alive && e.owner === this.playerIndex && e.kind === 'unit' && e.def.cat === 'villager');
+    const b = vills.length ? this._pickBuilding(this.mouse.x, this.mouse.y) : null;
+    const ok = b && b.owner === this.playerIndex && b.complete &&
+      b.def.dropSite && b.def.dropSite.includes('food');
+    if (!ok) {
+      if (r.farmPreview) { r.farmPreview = null; this._previewKey = null; }
+      return;
+    }
+
+    const key = `${b.id}:${vills.length}:${Math.floor(this.player.res.wood / 60)}`;
+    const now = performance.now();
+    if (key === this._previewKey && now - (this._previewAt || 0) < 400) return;
+    this._previewKey = key;
+    this._previewAt = now;
+
+    const plan = this.game.planFarmsAround(vills, b);
+    r.farmPreview = plan.map((p) => p.kind === 'new'
+      ? { tx: p.x, ty: p.y, size: p.size, reuse: false }
+      : { tx: p.farm.tx, ty: p.farm.ty, size: p.farm.size, reuse: true });
+  }
+
   _tryMassFarm(pt) {
+    if (this.spectator) return false;
     const vills = this.selection.filter((e) =>
       e.owner === this.playerIndex && e.kind === 'unit' && e.def.cat === 'villager');
     if (!vills.length) return false;
@@ -249,6 +301,7 @@ export class Input {
    * resulting order to each unit's queue instead of replacing it.
    */
   _rightClick(pt, shift) {
+    if (this.spectator) return;
     const mine = this.selection.filter((e) => e.owner === this.playerIndex);
     if (!mine.length) return;
     const units = mine.filter((e) => e.kind === 'unit');
@@ -344,6 +397,7 @@ export class Input {
   }
 
   _applyCursorMode(pt, shift) {
+    if (this.spectator) { this.cursorMode = null; document.body.style.cursor = ''; return; }
     const mode = this.cursorMode;
     this.cursorMode = null;
     document.body.style.cursor = '';
@@ -391,6 +445,7 @@ export class Input {
   /* ---------------- building placement ---------------- */
 
   startPlacement(bId) {
+    if (this.spectator) return;
     if (!this.player.isBuildingAvailable(bId)) return;
     this.placement = { id: bId, tx: 0, ty: 0, size: this.player.mods.building(bId).size, valid: false };
     this._updatePlacement();
@@ -399,15 +454,32 @@ export class Input {
   cancelPlacement() {
     this.placement = null;
     this.renderer.placement = null;
+    this._pendingFarmSpots = null;
   }
+
+  shiftHeld() { return this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'); }
 
   _updatePlacement() {
     if (!this.placement) return;
     const w = this.renderer.screenToWorld(this.mouse.x, this.mouse.y);
     if (!w) return;
     const size = this.placement.size;
-    const tx = Math.round(w.x - size / 2);
-    const ty = Math.round(w.y - size / 2);
+    let tx = Math.round(w.x - size / 2);
+    let ty = Math.round(w.y - size / 2);
+
+    // Farm + Shift while hovering a food drop-off building: snap to the closest
+    // free plot AROUND that building. Without this the ghost sits on the Mill
+    // itself, which is never a legal spot, so the click silently does nothing.
+    this.placement.snappedTo = null;
+    if (this.placement.id === 'farm' && this.shiftHeld()) {
+      const b = this._pickBuilding(this.mouse.x, this.mouse.y);
+      if (b && b.owner === this.playerIndex && b.complete &&
+          b.def.dropSite && b.def.dropSite.includes('food')) {
+        const spot = this.game._nearestFarmSpot(b, this.playerIndex, this._pendingFarmSpots || []);
+        if (spot) { tx = spot.x; ty = spot.y; this.placement.snappedTo = b.id; }
+      }
+    }
+
     this.placement.tx = tx;
     this.placement.ty = ty;
     this.placement.valid = this.game.canPlaceBuilding(this.placement.id, this.playerIndex, tx, ty) &&
@@ -416,16 +488,36 @@ export class Input {
   }
 
   _placeBuilding(keepPlacing) {
+    if (this.spectator) return;
     const p = this.placement;
     if (!p || !p.valid) return;
     const villagers = this.selection.filter((e) =>
       e.owner === this.playerIndex && e.kind === 'unit' && e.def.cat === 'villager');
-    const builders = villagers.length ? villagers : this._nearestIdleVillagers(p.tx, p.ty, 2);
+
+    let builders;
+    if (p.id === 'farm' && keepPlacing && villagers.length > 1) {
+      // One villager per plot, so each shift-click queues another farm with its
+      // own worker instead of sending the whole group at a single plot.
+      // Villagers already sent to build are skipped, which rotates through them.
+      const free = villagers.filter((v) => v.task.type !== 'build');
+      const pool = free.length ? free : villagers;
+      pool.sort((a, b) => Math.hypot(a.x - p.tx, a.y - p.ty) - Math.hypot(b.x - p.tx, b.y - p.ty));
+      builders = [pool[0]];
+    } else {
+      builders = villagers.length ? villagers : this._nearestIdleVillagers(p.tx, p.ty, 2);
+    }
     if (!builders.length) { this.player.notify('Select a villager first'); return; }
-    // holding shift queues the foundation behind whatever they are doing, and
-    // keeps the placement cursor active so several can be laid in a row
-    this.game.commandBuild(builders, p.id, p.tx, p.ty, keepPlacing);
+
+    const placed = this.game.commandBuild(builders, p.id, p.tx, p.ty, false);
     this._feedback(p.tx + p.size / 2, p.ty + p.size / 2, 'build', keepPlacing);
+
+    if (placed && keepPlacing) {
+      // The entity grid only rebuilds once per tick, so canPlaceBuilding cannot
+      // see this foundation yet. Remember it so rapid clicks do not stack plots.
+      if (!this._pendingFarmSpots) this._pendingFarmSpots = [];
+      this._pendingFarmSpots.push({ x: p.tx, y: p.ty, s: p.size });
+      if (this._pendingFarmSpots.length > 24) this._pendingFarmSpots.shift();
+    }
     if (!keepPlacing) this.cancelPlacement();
     else this._updatePlacement();
   }
@@ -444,8 +536,11 @@ export class Input {
   _onKeyDown(e) {
     if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
     this.keys.add(e.code);
+    if (e.code.startsWith('Shift')) { this._previewKey = null; this.updateFarmPreview(); this._updatePlacement(); }
     const mine = this.selection.filter((x) => x.owner === this.playerIndex);
     const units = mine.filter((x) => x.kind === 'unit');
+
+    if (this.spectator && this._spectatorKey(e)) return;
 
     // control groups
     if (e.code.startsWith('Digit')) {
@@ -516,6 +611,45 @@ export class Input {
         KeyF: 'farm', KeyR: 'barracks', KeyT: 'watchTower' };
       const id = quick[e.code];
       if (id && (BUILD_MENU[this.player.age] || []).includes(id)) this.startPlacement(id);
+    }
+  }
+
+  /**
+   * Spectator-only keys, handled before the normal bindings so the ones that
+   * would issue orders (S to stop, H to hold, Delete to kill) never run.
+   * @returns true if the key was consumed
+   */
+  _spectatorKey(e) {
+    const ctx = this.ctx;
+    switch (e.code) {
+      case 'Tab':
+        e.preventDefault();
+        ctx.setViewPlayer?.((this.playerIndex + 1) % this.game.players.length);
+        return true;
+      case 'Space':
+        e.preventDefault();
+        ctx.timeScale = ctx.timeScale === 0 ? (ctx.lastScale || 1) : 0;
+        if (ctx.timeScale !== 0) ctx.lastScale = ctx.timeScale;
+        return true;
+      case 'Equal': case 'NumpadAdd':
+        e.preventDefault();
+        ctx.timeScale = Math.min(8, (ctx.timeScale || 1) * 2);
+        ctx.lastScale = ctx.timeScale;
+        return true;
+      case 'Minus': case 'NumpadSubtract':
+        e.preventDefault();
+        ctx.timeScale = Math.max(0.5, (ctx.timeScale || 1) / 2);
+        ctx.lastScale = ctx.timeScale;
+        return true;
+      case 'KeyH':
+        // Normally Hold Position; with nothing to command, keep its other job.
+        this._selectTownCenter();
+        return true;
+      // These all end in a command, so they are simply dropped while watching.
+      case 'KeyA': case 'KeyP': case 'KeyS': case 'KeyG': case 'Delete':
+        return true;
+      default:
+        return false;
     }
   }
 
