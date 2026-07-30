@@ -7,8 +7,10 @@
     "start": "node server.js",
     "dev": "node server.js",
     "fetch-assets": "node scripts/fetch-assets.mjs",
-    "test": "node scripts/headless-test.mjs 25",
-    "test:render": "node scripts/render-test.mjs"
+    "test": "node scripts/ai-brain-check.mjs && node scripts/headless-test.mjs 25",
+    "test:render": "node scripts/render-test.mjs",
+    "test:ai": "node scripts/ai-brain-check.mjs",
+    "bench:ai": "node scripts/ai-bench.mjs 45 5 --solo"
   },
   "engines": {
     "node": ">=18"

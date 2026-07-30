@@ -13,6 +13,19 @@ import { CIVILIZATIONS, CIV_IDS } from './data/civs.js';
 const THREE_CDN = 'https://unpkg.com/three@0.169.0/build/three.module.js';
 const THREE_LOCAL = '/vendor/three.module.js';
 
+/**
+ * Selectable population limits.
+ *
+ * Fine steps at the bottom, where 25 population is a real difference to how a
+ * game plays, and coarse ones at the top, where it is not - the gap between 800
+ * and 900 changes nothing about the shape of a match, and a list of forty
+ * options is worse to use than a list of fifteen. Everything above the usual
+ * 200 is there for long games: the AI's economy is written in proportions of
+ * the limit, so it fills whatever it is given rather than stopping at a
+ * hard-coded villager count.
+ */
+const POP_LIMITS = [50, 75, 100, 125, 150, 200, 250, 300, 400, 500, 600, 700, 800, 900, 1000];
+
 async function loadThree(status) {
   // Prefer a vendored copy (npm run fetch-assets) so the game runs offline.
   try {
@@ -61,11 +74,38 @@ function buildMenu(onStart) {
             <option value="3">3</option>
           </select>
         </label>
-        <label class="watchonly hidden">Blue AI
+        <label class="watchonly hidden">Number of AIs
+          <select id="mAiCount">
+            <option value="2" selected>2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
+        </label>
+        <label class="watchonly hidden">Teams
+          <select id="mTeams">
+            <option value="ffa" selected>Free-for-all</option>
+            <option value="2v2">2 v 2</option>
+            <option value="3v1">3 v 1</option>
+            <option value="2v1">2 v 1</option>
+          </select>
+        </label>
+        <label class="watchonly hidden ai-slot" data-slot="0">AI 1
           <select id="mCivA">${civOptions}</select>
         </label>
-        <label class="watchonly hidden">Red AI
+        <label class="watchonly hidden ai-slot" data-slot="1">AI 2
           <select id="mCivB">${civOptions}</select>
+        </label>
+        <label class="watchonly hidden ai-slot" data-slot="2">AI 3
+          <select id="mCivC">${civOptions}</select>
+        </label>
+        <label class="watchonly hidden ai-slot" data-slot="3">AI 4
+          <select id="mCivD">${civOptions}</select>
+        </label>
+        <label>Map type
+          <select id="mMapType">
+            <option value="mixed" selected>Mixed — land and water</option>
+            <option value="land">Land only — no water</option>
+          </select>
         </label>
         <label>Difficulty
           <select id="mDiff">
@@ -76,9 +116,11 @@ function buildMenu(onStart) {
         </label>
         <label>Map size
           <select id="mSize">
-            <option value="96">Small</option>
-            <option value="120" selected>Medium</option>
-            <option value="150">Large</option>
+            <option value="120" selected>Small — 120×120</option>
+            <option value="152">Medium — 152×152</option>
+            <option value="184">Large — 184×184</option>
+            <option value="216">Huge — 216×216</option>
+            <option value="248">Giant — 248×248</option>
           </select>
         </label>
         <label>Starting age
@@ -98,9 +140,8 @@ function buildMenu(onStart) {
         </label>
         <label>Population limit
           <select id="mPop">
-            <option value="75">75</option>
-            <option value="125">125</option>
-            <option value="200" selected>200</option>
+            ${POP_LIMITS.map((n) =>
+    `<option value="${n}"${n === 200 ? ' selected' : ''}>${n}</option>`).join('')}
           </select>
         </label>
         <label>Map seed
@@ -119,15 +160,22 @@ function buildMenu(onStart) {
 
   const q = (id) => menu.querySelector('#' + id);
   const civSel = q('mCiv');
-  const civA = q('mCivA');
-  const civB = q('mCivB');
-  // default the two spectator civs to different ones so the first match is not
-  // a mirror unless the viewer actually asks for one
-  civA.value = CIV_IDS[0];
-  civB.value = CIV_IDS[1 % CIV_IDS.length];
+  const aiCivs = ['mCivA', 'mCivB', 'mCivC', 'mCivD'].map(q);
+  // default the spectator civs to different ones so the first match is not a
+  // mirror unless the viewer actually asks for one
+  aiCivs.forEach((sel, i) => { sel.value = CIV_IDS[i % CIV_IDS.length]; });
 
   let spectate = false;
   const info = q('civInfo');
+  const aiCount = () => parseInt(q('mAiCount').value, 10);
+
+  /** Team index per AI, from the chosen layout. Equal indices are allies. */
+  const teamsFor = (n, layout) => {
+    if (layout === '2v2' && n === 4) return [0, 0, 1, 1];
+    if (layout === '3v1' && n === 4) return [0, 0, 0, 1];
+    if (layout === '2v1' && n === 3) return [0, 0, 1];
+    return Array.from({ length: n }, (_, i) => i);   // free-for-all
+  };
 
   const civBlock = (c, label) => `
       <h3>${label ? label + ': ' : ''}${c.name} <span class="dim">— ${c.focus} civilization</span></h3>
@@ -137,17 +185,47 @@ function buildMenu(onStart) {
       ${c.ut2 ? `<div class="civline"><b>Imperial tech:</b> ${c.ut2.name} — ${c.ut2.desc}</div>` : ''}
       ${c.team ? `<div class="civline"><b>Team bonus:</b> ${c.team.desc}</div>` : ''}`;
 
+  const PLAYER_NAMES = ['Blue', 'Red', 'Green', 'Yellow'];
+
   const renderInfo = () => {
-    info.innerHTML = spectate
-      ? `<div class="civpair">
-           <div>${civBlock(CIVILIZATIONS[civA.value], 'Blue')}</div>
-           <div>${civBlock(CIVILIZATIONS[civB.value], 'Red')}</div>
-         </div>`
-      : civBlock(CIVILIZATIONS[civSel.value]);
+    if (!spectate) { info.innerHTML = civBlock(CIVILIZATIONS[civSel.value]); return; }
+    const n = aiCount();
+    const teams = teamsFor(n, q('mTeams').value);
+    // Allies share a team number, so say so rather than making the viewer
+    // decode it from the colours once the match has started.
+    const label = (i) => {
+      const allies = teams.map((t, k) => (t === teams[i] && k !== i ? PLAYER_NAMES[k] : null))
+        .filter(Boolean);
+      return PLAYER_NAMES[i] + (allies.length ? ` (with ${allies.join(', ')})` : '');
+    };
+    info.innerHTML = `<div class="civpair civ${n}">` +
+      aiCivs.slice(0, n)
+        .map((sel, i) => `<div>${civBlock(CIVILIZATIONS[sel.value], label(i))}</div>`)
+        .join('') + '</div>';
   };
+
+  // Team layouts only make sense for certain player counts, so the ones that
+  // do not fit are disabled rather than silently ignored.
+  const syncTeamOptions = () => {
+    const n = aiCount();
+    const sel = q('mTeams');
+    for (const opt of sel.options) {
+      const ok = opt.value === 'ffa' ||
+        (opt.value === '2v2' && n === 4) ||
+        (opt.value === '3v1' && n === 4) ||
+        (opt.value === '2v1' && n === 3);
+      opt.disabled = !ok;
+    }
+    if (sel.selectedOptions[0]?.disabled) sel.value = 'ffa';
+    for (const n2 of menu.querySelectorAll('.ai-slot')) {
+      n2.classList.toggle('hidden', spectate ? Number(n2.dataset.slot) >= n : true);
+    }
+  };
+
   civSel.onchange = renderInfo;
-  civA.onchange = renderInfo;
-  civB.onchange = renderInfo;
+  for (const sel of aiCivs) sel.onchange = renderInfo;
+  q('mAiCount').onchange = () => { syncTeamOptions(); renderInfo(); };
+  q('mTeams').onchange = renderInfo;
 
   const setMode = (watch) => {
     spectate = watch;
@@ -160,6 +238,7 @@ function buildMenu(onStart) {
       ? 'You are a spectator — the AIs play themselves. Tab switches whose economy you are watching, ' +
         'Space pauses, and +/− changes the speed.'
       : 'Left-drag to select · Right-click to command · F1 for the full guide';
+    syncTeamOptions();
     renderInfo();
   };
   q('mModePlay').onclick = () => setMode(false);
@@ -169,8 +248,14 @@ function buildMenu(onStart) {
   menu.querySelector('#mRandom').onclick = () => {
     const pick = () => CIV_IDS[Math.floor(Math.random() * CIV_IDS.length)];
     if (spectate) {
-      civA.value = pick();
-      do { civB.value = pick(); } while (civB.value === civA.value && CIV_IDS.length > 1);
+      const used = new Set();
+      for (const sel of aiCivs.slice(0, aiCount())) {
+        let v = pick();
+        // distinct where possible, so a 4-way is four different civs
+        for (let t = 0; t < 30 && used.has(v); t++) v = pick();
+        used.add(v);
+        sel.value = v;
+      }
     } else {
       civSel.value = pick();
     }
@@ -180,9 +265,11 @@ function buildMenu(onStart) {
     const opts = {
       spectate,
       civ: civSel.value,
-      civs: [civA.value, civB.value],
+      civs: aiCivs.slice(0, aiCount()).map((s) => s.value),
+      teams: teamsFor(aiCount(), q('mTeams').value),
       opponents: parseInt(menu.querySelector('#mOpp').value, 10),
       difficulty: menu.querySelector('#mDiff').value,
+      mapType: menu.querySelector('#mMapType').value,
       size: parseInt(menu.querySelector('#mSize').value, 10),
       startAge: menu.querySelector('#mAge').value,
       startRes: menu.querySelector('#mRes').value,
@@ -218,12 +305,13 @@ async function startGame(THREE, opts, status) {
   status('Generating map...');
   const players = [];
   if (opts.spectate) {
-    // Two AIs, nobody human. The viewer still "is" one of them for the purposes
-    // of the HUD (whose resources are on the bar, whose units the minimap
-    // highlights) and can switch with Tab.
-    const names = ['Blue AI', 'Red AI'];
-    for (let i = 0; i < 2; i++) {
-      players.push({ civ: opts.civs[i], name: names[i], team: i, popMax: opts.popMax });
+    // Two to four AIs, nobody human. The viewer still "is" one of them for the
+    // purposes of the HUD (whose resources are on the bar, whose units the
+    // minimap highlights) and can switch with Tab.
+    const names = ['Blue AI', 'Red AI', 'Green AI', 'Yellow AI'];
+    const teams = opts.teams || opts.civs.map((_, i) => i);
+    for (let i = 0; i < opts.civs.length; i++) {
+      players.push({ civ: opts.civs[i], name: names[i], team: teams[i], popMax: opts.popMax });
     }
   } else {
     const civPool = CIV_IDS.filter((c) => c !== opts.civ);
@@ -243,7 +331,8 @@ async function startGame(THREE, opts, status) {
     mapSize: opts.size,
     players,
     speed: 1.7,
-    // A spectator has no side to be denied information, and watching two black
+    mapType: opts.mapType,
+    // A spectator has no side to be denied information, and watching black
     // fog-shrouded bases would defeat the point.
     revealAll: !!opts.spectate,
   });
@@ -272,7 +361,10 @@ async function startGame(THREE, opts, status) {
   ctx.hud = hud;
   const overlay = new Overlay(ctx);
   ctx.effects = overlay;
-  if (opts.spectate) hud.buildSpectatorBar();
+  if (opts.spectate) {
+    hud.buildSpectatorBar();
+    renderer.setSpectator(true);
+  }
 
   // Switching who we are watching has to move every consumer of playerIndex at
   // once - HUD, input and the fog the renderer draws - or the resource bar ends
@@ -325,6 +417,11 @@ async function startGame(THREE, opts, status) {
     const scale = ctx.timeScale;
     acc += dtReal * scale;
     const maxTicks = Math.max(1, Math.round(6 * Math.max(1, scale)));
+    // At 16x a machine that cannot keep up would otherwise build a backlog it
+    // can never drain, and the game would keep running fast long after the
+    // speed was turned back down. Better to quietly drop the surplus and run at
+    // whatever multiple the hardware actually manages.
+    acc = Math.min(acc, TICK * maxTicks * 2);
 
     let ticks = 0;
     let simulated = 0;

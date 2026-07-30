@@ -82,6 +82,11 @@ export class Renderer {
     this.yaw = Math.PI / 4;
     this.pitch = 0.62;
     this.zoom = 15;               // half-height of the view in tiles
+    // How far out the camera may pull. A spectator watching four AIs wants to
+    // see the whole map at once, which 45 tiles of half-height cannot do on a
+    // 120-tile map, let alone a bigger one; a player is better served by a
+    // tighter limit that keeps units legible. `setSpectator` opens it up.
+    this.maxZoom = 45;
     this.center = { x: this.game.size / 2, y: this.game.size / 2 };
     this._applyCamera();
   }
@@ -98,8 +103,21 @@ export class Renderer {
     this.camera.updateMatrixWorld();
   }
 
+  /**
+   * Opens the zoom limit up for spectating.
+   *
+   * Scaled to the map so the widest setting always frames the whole thing -
+   * a fixed ceiling that suits a 120-tile map still cannot show a 200-tile one,
+   * and watching four AIs fight is the one case where seeing everything at once
+   * is the entire point.
+   */
+  setSpectator(on) {
+    this.maxZoom = on ? Math.max(45, this.game.size * 0.75) : 45;
+    if (!on) this.setZoom(Math.min(this.zoom, 45));
+  }
+
   setZoom(z) {
-    this.zoom = Math.max(7, Math.min(45, z));
+    this.zoom = Math.max(7, Math.min(this.maxZoom, z));
     this.resize();
   }
 

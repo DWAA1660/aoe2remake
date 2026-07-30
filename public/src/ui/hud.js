@@ -210,7 +210,7 @@ export class HUD {
       if (c.timeScale !== 0) c.lastScale = c.timeScale;
     };
     controls.appendChild(this.specPause);
-    for (const s of [1, 2, 4, 8]) {
+    for (const s of [1, 2, 4, 8, 16]) {
       const b = el('button', 'topbtn spd', s + '×');
       b.onclick = () => { this.ctx.timeScale = s; this.ctx.lastScale = s; };
       b.dataset.speed = String(s);

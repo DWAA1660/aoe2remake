@@ -6,7 +6,18 @@
 // runs several seeds for a long enough game to see the boom, and prints the
 // medians - which is the only signal worth tuning against.
 //
-//   node scripts/ai-bench.mjs [minutes] [games]
+// `--solo` runs one AI alone on the map. Two AIs on one map is the right test
+// of the whole player, but it is a terrible instrument for tuning the economy:
+// whichever side happens to win annihilates the other, so a one-line change to
+// a gather weight swings the reported villager count from 130 to 3 and every
+// measurement looks like a catastrophe or a triumph. Solo removes the opponent
+// and measures only what the boom is capable of.
+//
+// `--pop=N` sets the population limit, which the AI's economy is written as
+// proportions of - so this is the switch for checking that a 1000-pop game
+// actually fills its limit rather than stopping at a 200-pop economy.
+//
+//   node scripts/ai-bench.mjs [minutes] [games] [--solo] [--pop=N]
 
 import { Game, TICK } from '../public/src/sim/game.js';
 import { AI } from '../public/src/sim/ai.js';
@@ -14,6 +25,9 @@ import { CIVILIZATIONS } from '../public/src/data/civs.js';
 
 const minutes = parseFloat(process.argv[2] || '30');
 const games = parseInt(process.argv[3] || '5', 10);
+const solo = process.argv.includes('--solo');
+const popArg = process.argv.find((a) => a.startsWith('--pop='));
+const popMax = popArg ? parseInt(popArg.slice(6), 10) : 200;
 const CIV_IDS = Object.keys(CIVILIZATIONS);
 
 const AGES = ['dark', 'feudal', 'castle', 'imperial'];
@@ -23,12 +37,14 @@ function runGame(seed) {
     seed,
     mapSize: 120,
     speed: 1.0,
-    players: [
-      { civ: CIV_IDS[seed % CIV_IDS.length], name: 'AI-A', team: 0 },
-      { civ: CIV_IDS[(seed * 7 + 3) % CIV_IDS.length], name: 'AI-B', team: 1 },
-    ],
+    players: solo
+      ? [{ civ: CIV_IDS[seed % CIV_IDS.length], name: 'AI-A', team: 0, popMax }]
+      : [
+        { civ: CIV_IDS[seed % CIV_IDS.length], name: 'AI-A', team: 0, popMax },
+        { civ: CIV_IDS[(seed * 7 + 3) % CIV_IDS.length], name: 'AI-B', team: 1, popMax },
+      ],
   });
-  const ais = [new AI(game, 0, 'moderate'), new AI(game, 1, 'moderate')];
+  const ais = game.players.map((_, i) => new AI(game, i, 'moderate'));
   const ticks = Math.round((minutes * 60) / TICK);
 
   // Idle time is sampled rather than measured at the end: a snapshot of the
@@ -64,6 +80,8 @@ function runGame(seed) {
   const p = game.players[0];
   const mine = game.entities.filter((e) => e.alive && e.owner === 0);
   const vills = mine.filter((e) => e.kind === 'unit' && e.def.cat === 'villager').length;
+  const carts = mine.filter((e) => e.kind === 'unit' && e.def.cat === 'trade').length;
+  const bld = (t) => mine.filter((e) => e.kind === 'building' && e.type === t).length;
   const armyUnits = mine.filter((e) => e.kind === 'unit' &&
     ['infantry', 'cavalry', 'archer', 'siege', 'monk'].includes(e.def.cat));
   const army = armyUnits.length;
@@ -72,6 +90,11 @@ function runGame(seed) {
     seed,
     age: p.ageIndex,
     vills,
+    carts,
+    markets: bld('market'),
+    tcs: bld('townCenter'),
+    castles: bld('castle'),
+    towers: bld('watchTower') + bld('guardTower') + bld('keep'),
     army,
     buildings: mine.filter((e) => e.kind === 'building').length,
     siegePct: army ? (siege / army) * 100 : 0,
@@ -96,7 +119,7 @@ const median = (xs) => {
 };
 
 console.log(`AI bench: ${games} games x ${minutes} min\n`);
-const head = 'seed    age        vill  army sge%   pop  bldg  gathered  techs  float | idle  work  walk  haul  bld   oth  ageAt';
+const head = 'seed    age        vill  army sge%   pop  bldg  gathered  techs  float | tc mkt crt cst twr | idle  work  walk  haul  bld   oth  ageAt';
 console.log(head);
 console.log('-'.repeat(head.length));
 
@@ -105,6 +128,8 @@ const line = (label, r) =>
   `${String(r.vills).padStart(4)}  ${String(r.army).padStart(4)} ${r.siegePct.toFixed(0).padStart(3)}%  ` +
   `${String(r.pop).padStart(3)}/${String(r.popCap).padEnd(3)} ${String(r.buildings).padStart(4)}  ${String(r.gathered).padStart(8)}  ` +
   `${String(r.techs).padStart(5)}  ${String(r.float).padStart(5)} | ` +
+  `${String(r.tcs).padStart(2)} ${String(r.markets).padStart(3)} ${String(r.carts).padStart(3)} ` +
+  `${String(r.castles).padStart(3)} ${String(r.towers).padStart(3)} | ` +
   [r.idlePct, r.workPct, r.walkPct, r.haulPct, r.buildPct, r.otherPct]
     .map((v) => v.toFixed(0).padStart(4)).join('  ') + '  ' + (r.ageAt ?? '');
 
@@ -121,6 +146,8 @@ console.log(line('median', {
   age: med('age'), vills: med('vills'), army: med('army'), buildings: med('buildings'),
   gathered: med('gathered'), techs: med('techs'), float: med('float'),
   siegePct: med('siegePct'), pop: med('pop'), popCap: med('popCap'),
+  carts: med('carts'), markets: med('markets'), tcs: med('tcs'),
+  castles: med('castles'), towers: med('towers'),
   idlePct: med('idlePct'), workPct: med('workPct'), walkPct: med('walkPct'),
   haulPct: med('haulPct'), buildPct: med('buildPct'), otherPct: med('otherPct'),
 }));

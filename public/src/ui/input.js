@@ -633,7 +633,7 @@ export class Input {
         return true;
       case 'Equal': case 'NumpadAdd':
         e.preventDefault();
-        ctx.timeScale = Math.min(8, (ctx.timeScale || 1) * 2);
+        ctx.timeScale = Math.min(16, (ctx.timeScale || 1) * 2);
         ctx.lastScale = ctx.timeScale;
         return true;
       case 'Minus': case 'NumpadSubtract':

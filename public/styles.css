@@ -291,6 +291,12 @@ ul.keys b { color: var(--gold); }
 }
 .civpair { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .civpair > div { min-width: 0; }
+/* Three or four AIs still have to fit the panel, so the text steps down. */
+.civpair.civ3, .civpair.civ4 { gap: 12px; font-size: 11px; }
+.civpair.civ3 { grid-template-columns: repeat(3, 1fr); }
+.civpair.civ4 { grid-template-columns: repeat(4, 1fr); }
+.civpair.civ3 h3, .civpair.civ4 h3 { font-size: 13px; }
+.civpair.civ3 ul, .civpair.civ4 ul { padding-left: 14px; }
 
 /* ---------------- spectator bar ---------------- */
 .specbar {

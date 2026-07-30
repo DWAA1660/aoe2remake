@@ -25,6 +25,10 @@ const PATH_BUDGET_MAX = 240;
 const REPLAN_INTERVAL = 2.5;
 const FOG_INTERVAL = 4;              // ticks between fog recomputes
 const CARRY_BASE = 10;
+/** How far a cry for help carries to idle soldiers. */
+const DISTRESS_RADIUS = 26;
+/** How long after being hit something still counts as under attack. */
+const DISTRESS_SECONDS = 4;
 
 export class Game {
   constructor(config) {
@@ -44,6 +48,7 @@ export class Game {
       seed: config.seed ?? 1,
       players: config.players.length,
       waterAmount: config.waterAmount ?? 0.5,
+      mapType: config.mapType ?? 'mixed',
     });
     this.map = map;
     this.size = map.size;
@@ -228,6 +233,18 @@ export class Game {
         pl.stats.buildingsLost++;
       }
       if (!e.def.gate && !e.def.farmFood) this.grid.setBlocked(e.tx, e.ty, e.size, false);
+      // Anything still in the queue is refunded, and a half-researched tech has
+      // to stop counting as in progress. Leaving it in `researching` marks it
+      // unavailable for the rest of the game: one AI lost the Town Center that
+      // held Hand Cart and then showed it as "researching" for thirty-four
+      // minutes, unable to queue it anywhere else.
+      if (pl) {
+        for (const item of e.queue) {
+          pl.refund(item.cost);
+          if (item.kind === 'tech') pl.researching.delete(item.id);
+        }
+      }
+      e.queue.length = 0;
       for (const g of e.garrison) {
         // garrisoned units die with the building except in Town Centers/Castles
         if (e.type === 'townCenter' || e.type === 'castle') this._ungarrisonOne(e, g);
@@ -463,6 +480,8 @@ export class Game {
     if (u.task.type === 'idle' && u.orders && u.orders.length) {
       this._startOrder(u, u.orders.shift());
     }
+
+    this._retaliate(u);
 
     switch (u.task.type) {
       case 'idle': this._taskIdle(u, dt); break;
@@ -708,7 +727,79 @@ export class Game {
     if (this.tickCount % 6 !== u.id % 6) return;
     const range = Math.max(u.def.los, (u.def.range || 0) + 2);
     const target = this._findTarget(u, range);
-    if (target) u.task = { type: 'attack', targetId: target.id, auto: true, homeX: u.x, homeY: u.y };
+    if (target) {
+      u.task = { type: 'attack', targetId: target.id, auto: true, homeX: u.x, homeY: u.y };
+      return;
+    }
+    // Nothing in sight, but something of ours nearby may be dying just outside
+    // it. Standing in the town while villagers are cut down forty tiles away is
+    // the single most frustrating thing an idle army does.
+    if (u.stance !== 'aggressive') return;
+    const cry = this._distressCall(u);
+    if (cry) u.task = { type: 'attackMove', x: cry.x, y: cry.y };
+  }
+
+  /**
+   * The nearest of our own things that has been hit in the last few seconds.
+   *
+   * This is the distress signal: anything of ours taking damage broadcasts its
+   * position simply by recording when it was hurt, and idle soldiers on the
+   * aggressive stance walk toward it. It costs nothing to maintain - the timer
+   * is already there for other reasons - and it is what turns a garrison of
+   * idle units into a reaction force.
+   */
+  _distressCall(u) {
+    const now = this.time;
+    let best = null, bestD = Infinity;
+    this.entityGrid.forEachNear(u.x, u.y, DISTRESS_RADIUS, (e) => {
+      if (!e.alive || e.owner !== u.owner || e === u) return;
+      if (!e.lastDamaged || now - e.lastDamaged > DISTRESS_SECONDS) return;
+      // Buildings can look after themselves for a moment; people cannot.
+      const weight = e.kind === 'unit' ? 1 : 1.6;
+      const d = Math.hypot(e.x - u.x, e.y - u.y) * weight;
+      if (d < bestD) { bestD = d; best = e; }
+    });
+    return best;
+  }
+
+  /**
+   * A unit being shot at while doing something else should turn and fight.
+   *
+   * Without this a soldier walking to a rally point dies without ever raising
+   * its weapon, because `move` has no target acquisition of its own - it just
+   * walks, takes hits, and keeps walking. The interrupted task is remembered
+   * and resumed once the attacker is dealt with, so an order is delayed rather
+   * than thrown away.
+   */
+  _retaliate(u) {
+    if (u.garrisonedIn || u.stance === 'noAttack') return;
+    if (!u.def.atk || !Object.keys(u.def.atk).length) return;
+    if (!u.lastDamaged || this.time - u.lastDamaged > 1.5) return;
+    const t = u.task.type;
+    // These already fight, or must not be broken off.
+    if (t === 'attack' || t === 'attackMove' || t === 'patrol' ||
+        t === 'convert' || t === 'garrison') return;
+
+    const attacker = this.get(u.lastAttacker);
+    if (!attacker || !attacker.alive || attacker.garrisonedIn) return;
+    if (!this.isEnemy(u.owner, attacker.owner)) return;
+
+    const reach = Math.max(u.def.los, (u.def.range || 0) + 2);
+    const dist = this._distTo(u, attacker);
+    if (dist > reach) return;
+    // Stand Ground swings at whatever comes to it but never walks off its spot.
+    if (u.stance === 'standGround' && dist > (u.def.range || 1) + 0.5) return;
+    // A villager is not a soldier. It will defend itself against another
+    // villager - a forward builder, someone stealing a boar - but throwing
+    // peasants at cavalry only loses the peasants faster, and the player's own
+    // orders are usually the better plan.
+    if (u.def.cat === 'villager' &&
+        attacker.def.cat !== 'villager' && attacker.def.cat !== 'trade') return;
+
+    u.task = { type: 'attack', targetId: attacker.id, auto: true, resumeTask: u.task };
+    u.path = null;
+    u.pathIdx = 0;
+    u.repathCd = 0;
   }
 
   /**
@@ -852,6 +943,15 @@ export class Game {
     if (!target || !target.alive || target.garrisonedIn) {
       if (u.task.resume) { u.task = { type: 'attackMove', x: u.task.resume.x, y: u.task.resume.y }; return; }
       if (u.task.resumePatrol) { u.task = u.task.resumePatrol; return; }
+      // Back to whatever it was doing before it was interrupted - the order was
+      // postponed by the fight, not cancelled by it.
+      if (u.task.resumeTask) {
+        u.task = u.task.resumeTask;
+        u.path = null;
+        u.pathIdx = 0;
+        u.repathCd = 0;
+        return;
+      }
       u.task = { type: 'idle' };
       return;
     }
@@ -1877,6 +1977,37 @@ export class Game {
   /** Turns a queued order back into a live task. */
   _startOrder(u, o) {
     u.repathCd = 0;
+    // A fresh order is not responsible for the last one's failures.
+    u.moveTries = 0;
+    // Drop the route the previous order left behind - but only for the orders
+    // that do not immediately ask for a new one.
+    //
+    // `move`, `attackMove` and `patrol` call `requestPath` below, which replaces
+    // the route anyway; clearing it first only makes `_taskMove` see a missing
+    // path, request a *second* one, and burn a retry doing it. Five of those and
+    // it gives up and goes idle, which is how this turned into villagers
+    // standing around.
+    //
+    // Every other order just swapped the task and let the old path stand.
+    // `_approach` reuses a path until it runs out of waypoints, so a unit
+    // re-targeted onto something new first walked all the way to wherever the
+    // *old* target had been and only then noticed. That is the bug this exists
+    // to fix, and it hit villagers re-tasked onto a different resource exactly
+    // as hard as soldiers given a new target mid-fight.
+    //
+    // And only when it is genuinely heading elsewhere. Re-tasking a villager
+    // onto the next tree in the same woodline must not throw away a route it
+    // has nearly finished walking - the AI re-tasks constantly, and clearing
+    // every time floods the path queue and leaves villagers standing about
+    // waiting for a search that the old path had already done.
+    if (o.type !== 'move' && o.type !== 'attackMove' && o.type !== 'patrol') {
+      const t = o.targetId !== undefined ? this.get(o.targetId) : null;
+      const end = u.path && u.path.length ? u.path[u.path.length - 1] : null;
+      if (!t || !end || Math.hypot(end.x - t.x, end.y - t.y) > 3) {
+        u.path = null;
+        u.pathIdx = 0;
+      }
+    }
     switch (o.type) {
       case 'move':
         u.task = { type: 'move', x: o.x, y: o.y };
@@ -2038,7 +2169,12 @@ export class Game {
    * spatial grid is only rebuilt once per tick, so canPlaceBuilding cannot see
    * farms placed moments ago and every plot would land on the same tile.
    */
-  _nearestFarmSpot(building, owner, taken) {
+  /**
+   * @param reject optional (x, y) => boolean to veto a spot. The AI uses it to
+   *        keep plots out of an enemy Castle's range and off ground where its
+   *        villagers have recently been killed; the human UI passes nothing.
+   */
+  _nearestFarmSpot(building, owner, taken, reject) {
     const size = this.players[owner].mods.building('farm').size;
     const cx = building.x, cy = building.y;
     const R = 11;
@@ -2050,6 +2186,7 @@ export class Game {
         if (taken.some((r) => tx < r.x + r.s && tx + size > r.x &&
                               ty < r.y + r.s && ty + size > r.y)) continue;
         if (!this.canPlaceBuilding('farm', owner, tx, ty)) continue;
+        if (reject && reject(tx + size / 2, ty + size / 2)) continue;
         bestD = d; best = { x: tx, y: ty, s: size };
       }
     }
@@ -2271,6 +2408,31 @@ export class Game {
     pl.refund(item.cost);
     if (item.kind === 'tech') pl.researching.delete(item.id);
     building.queue.splice(index, 1);
+  }
+
+  /**
+   * Sends resources to an ally, minus the market fee.
+   *
+   * Both sides need a Market, which is what stops this from being a free
+   * resource teleport in the Dark Age. The fee is the sender's - Coinage and
+   * Banking are worth buying partly because they make you a better ally.
+   * @returns the amount actually delivered, or 0
+   */
+  tribute(fromIndex, toIndex, res, amount) {
+    const from = this.players[fromIndex];
+    const to = this.players[toIndex];
+    if (!from || !to || from === to || to.defeated) return 0;
+    if (!this.isAlly(fromIndex, toIndex)) return 0;
+    const amt = Math.min(amount, from.res[res] || 0);
+    if (amt < 100) return 0;                    // 100 at a time, like the Market
+    const hasMarket = (pl) => this.entities.some((e) =>
+      e.alive && e.kind === 'building' && e.owner === pl.index && e.type === 'market' && e.complete);
+    if (!hasMarket(from) || !hasMarket(to)) return 0;
+    const sent = Math.round(amt * (1 - from.mods.marketFee));
+    from.res[res] -= amt;
+    to.give(res, sent);
+    to.notify(`${from.name} sent ${sent} ${res}`);
+    return sent;
   }
 
   /** Market buying/selling, 100 resource units at a time. */

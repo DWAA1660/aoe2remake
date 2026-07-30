@@ -11,6 +11,7 @@ import { BUILDINGS } from '../public/src/data/buildings.js';
 import { computeDamage } from '../public/src/data/armor.js';
 import { PathGrid } from '../public/src/core/pathfinding.js';
 import { RESOURCE_INFO, makeResource } from '../public/src/sim/entity.js';
+import { generateMap } from '../public/src/sim/map.js';
 
 // 18 minutes, not 10: on a poor map the AI reaches 17 villagers around minute
 // 10 and then needs another 4 to bank the 500 food plus 130 seconds to research
@@ -346,6 +347,143 @@ console.log('\n=== A villager sent across water ===');
   assert(reversals <= 3, `it does not oscillate at the shoreline (${reversals} reversals)`);
 }
 
+/* ---------------- map wealth and connectivity ---------------- */
+
+console.log('\n=== Map generation ===');
+{
+  let worstReach = 1, unreachableStarts = 0;
+  const tot = { wood: 0, gold: 0, stone: 0, food: 0 };
+  const maps = 8;
+  for (let s = 0; s < maps; s++) {
+    const m = generateMap({ size: 120, seed: 1000 + s * 77, players: 2 });
+    for (const r of m.resources) {
+      if (r.type === 'tree') tot.wood += r.amount || 0;
+      else if (r.type === 'gold') tot.gold += r.amount || 0;
+      else if (r.type === 'stone') tot.stone += r.amount || 0;
+      else if (r.type === 'berries') tot.food += r.amount || 0;
+    }
+    // Every extra blocking resource is a tile units cannot walk on, so a
+    // richer map must not quietly seal itself into pockets.
+    const size = m.size, seen = new Uint8Array(size * size);
+    let land = 0;
+    for (let i = 0; i < size * size; i++) {
+      if (m.grid.isPassable(i % size, (i / size) | 0, 'land')) land++;
+    }
+    const q = [[m.starts[0].x, m.starts[0].y]];
+    seen[m.starts[0].y * size + m.starts[0].x] = 1;
+    let n = 0;
+    while (q.length) {
+      const [x, y] = q.pop(); n++;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy, k = ny * size + nx;
+        if (nx < 0 || ny < 0 || nx >= size || ny >= size || seen[k]) continue;
+        if (!m.grid.isPassable(nx, ny, 'land')) continue;
+        seen[k] = 1; q.push([nx, ny]);
+      }
+    }
+    worstReach = Math.min(worstReach, n / land);
+    for (const st of m.starts) if (!seen[st.y * size + st.x]) unreachableStarts++;
+  }
+  const per = (k) => Math.round(tot[k] / maps);
+  assert(per('wood') > 90000, `maps carry plenty of wood (${per('wood')} per map)`);
+  assert(per('gold') > 65000, `and gold (${per('gold')})`);
+  assert(per('stone') > 12000, `and stone (${per('stone')})`);
+  assert(unreachableStarts === 0, `every start is reachable from every other (${unreachableStarts} bad)`);
+  assert(worstReach > 0.95,
+    `no map seals itself into pockets (worst is ${(worstReach * 100).toFixed(1)}% of land reachable)`);
+}
+
+/* ---------------- every map size works ---------------- */
+
+console.log('\n=== All five map sizes ===');
+{
+  const SIZES = [120, 152, 184, 216, 248];
+  let lastWood = 0, lastGold = 0, scalesUp = true;
+  const bad = [];
+  for (const size of SIZES) {
+    const m = generateMap({ size, seed: 909, players: 4 });
+    const amt = { wood: 0, gold: 0, stone: 0 };
+    for (const r of m.resources) {
+      if (r.type === 'tree') amt.wood += r.amount || 0;
+      else if (r.type === 'gold') amt.gold += r.amount || 0;
+      else if (r.type === 'stone') amt.stone += r.amount || 0;
+    }
+    // Four starts, all mutually reachable, on every size.
+    const seen = new Uint8Array(size * size);
+    let land = 0;
+    for (let i = 0; i < size * size; i++) {
+      if (m.grid.isPassable(i % size, (i / size) | 0, 'land')) land++;
+    }
+    const q = [[m.starts[0].x, m.starts[0].y]];
+    seen[m.starts[0].y * size + m.starts[0].x] = 1;
+    let n = 0;
+    while (q.length) {
+      const [x, y] = q.pop(); n++;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy, k = ny * size + nx;
+        if (nx < 0 || ny < 0 || nx >= size || ny >= size || seen[k]) continue;
+        if (!m.grid.isPassable(nx, ny, 'land')) continue;
+        seen[k] = 1; q.push([nx, ny]);
+      }
+    }
+    if (m.starts.length !== 4) bad.push(`${size}: ${m.starts.length} starts`);
+    if (m.starts.some((s) => !seen[s.y * size + s.x])) bad.push(`${size}: start unreachable`);
+    if (n / land < 0.95) bad.push(`${size}: only ${(n / land * 100).toFixed(0)}% reachable`);
+    // Bigger maps must carry proportionally more of everything, or a large map
+    // is simply a small one with longer walks. Mines used to scale with width
+    // while area scales with the square, which left them thin.
+    if (amt.wood <= lastWood || amt.gold <= lastGold) scalesUp = false;
+    lastWood = amt.wood; lastGold = amt.gold;
+  }
+  assert(bad.length === 0, `every size generates a sound map (${bad.join('; ') || 'all five ok'})`);
+  assert(scalesUp, 'wood and gold both grow with every step up in size');
+  assert(SIZES[0] === 120, 'the smallest size is the one the game used to ship with');
+}
+
+/* ---------------- players keep to their own side ---------------- */
+
+console.log('\n=== Two AIs do not share a woodline ===');
+{
+  // Runs two AIs on the same map and asks, of every node being gathered,
+  // whether it is closer to the gatherer's own town or to the opponent's.
+  let trespass = 0, total = 0, shared = 0;
+  for (const seed of [1000, 2554]) {
+    const g = new Game({ seed, mapSize: 120, speed: 1.0, players: [
+      { civ: CIV_IDS[seed % CIV_IDS.length], name: 'A', team: 0 },
+      { civ: CIV_IDS[(seed * 7 + 3) % CIV_IDS.length], name: 'B', team: 1 }] });
+    const ais = [new AI(g, 0, 'moderate'), new AI(g, 1, 'moderate')];
+    const homes = g.map.starts;
+    for (let i = 0; i < Math.round(25 * 60 / TICK); i++) {
+      g.update(TICK);
+      if (i % 20 === 0) for (const a of ais) a.update(1);
+      if (i % 400 !== 0 || g.time < 300) continue;
+      const worked = [new Set(), new Set()];
+      for (const e of g.entities) {
+        if (!e.alive || e.kind !== 'unit' || e.owner < 0 || e.owner > 1) continue;
+        if (e.def.cat !== 'villager' || e.task.type !== 'gather' || !e.task.targetId) continue;
+        const node = g.get(e.task.targetId);
+        if (!node || node.kind !== 'resource') continue;
+        worked[e.owner].add(node.id);
+        const mine = Math.hypot(node.x - homes[e.owner].x, node.y - homes[e.owner].y);
+        const theirs = Math.hypot(node.x - homes[1 - e.owner].x, node.y - homes[1 - e.owner].y);
+        total++;
+        if (theirs < mine) trespass++;
+      }
+      for (const id of worked[0]) if (worked[1].has(id)) shared++;
+    }
+  }
+  // A guard on the invariant, not a claimed improvement: measured both with and
+  // without the locality scoring, trespassing sits at about 1% on this map -
+  // the AI already prefers what is near its own drop-offs. This exists so a
+  // future scoring change cannot quietly send both players into the same
+  // woodline without anyone noticing.
+  assert(total > 2000, `enough gathering was sampled (${total} villager-node observations)`);
+  const pct = (trespass / Math.max(1, total)) * 100;
+  assert(pct < 3,
+    `villagers work their own half of the map (${pct.toFixed(1)}% on the enemy's side)`);
+  assert(shared < 40, `the two AIs rarely contest the same node (${shared} shared observations)`);
+}
+
 console.log('\n=== Counter system ===');
 {
   const halb = UNITS.halberdier, knight = UNITS.knight, champ = UNITS.champion;
@@ -452,21 +590,28 @@ console.log('\n=== AI booms to a real Imperial army ===');
   // the last tick can catch the economy mid-raid. What is being tested is that
   // production never stops, and the high-water mark measures exactly that
   // while a snapshot measures whoever happened to be winning at minute 60.
-  let peakVills = 0, peakPop = 0;
+  const peakVills = [0, 0], peakPop = [0, 0];
   for (let i = 0; i < Math.round(60 * 60 / TICK); i++) {
     g.update(TICK);
     if (i % 20 === 0) for (const a of ais) a.update(1);
     if (i % 200 === 0) {
-      const n = g.entities.filter((e) => e.alive && e.owner === 0 &&
-        e.kind === 'unit' && e.def.cat === 'villager').length;
-      peakVills = Math.max(peakVills, n);
-      peakPop = Math.max(peakPop, g.players[0].pop / g.players[0].effectivePopCap);
+      for (const k of [0, 1]) {
+        const n = g.entities.filter((e) => e.alive && e.owner === k &&
+          e.kind === 'unit' && e.def.cat === 'villager').length;
+        peakVills[k] = Math.max(peakVills[k], n);
+        peakPop[k] = Math.max(peakPop[k], g.players[k].pop / g.players[k].effectivePopCap);
+      }
     }
     if (g.over) break;
   }
+  // Both sides run identical code, and one of them loses the war - which one
+  // swings on map luck. Asserting on a fixed player index makes this a test of
+  // who won rather than of whether the AI plays well, so the checks below look
+  // at whichever side got to play a full game.
+  const k = peakVills[0] >= peakVills[1] ? 0 : 1;
 
-  const p = g.players[0];
-  const mine = g.entities.filter((e) => e.alive && e.owner === 0);
+  const p = g.players[k];
+  const mine = g.entities.filter((e) => e.alive && e.owner === k);
   const vills = mine.filter((e) => e.kind === 'unit' && e.def.cat === 'villager');
   const army = mine.filter((e) => e.kind === 'unit' &&
     ['infantry', 'cavalry', 'archer', 'siege', 'monk'].includes(e.def.cat));
@@ -474,12 +619,14 @@ console.log('\n=== AI booms to a real Imperial army ===');
 
   // Villager production used to stop dead at the age gate, pinning the economy
   // around 50 for the whole game.
-  assert(peakVills >= 90, `it keeps making villagers (peaked at ${peakVills})`);
+  assert(peakVills[k] >= 90, `it keeps making villagers (peaked at ${peakVills[k]})`);
+  assert(Math.min(...peakVills) >= 40,
+    `both sides kept producing while alive (${peakVills.join(' and ')})`);
   assert(p.ageIndex >= 3, `it reaches Imperial (${p.age})`);
   // The army should be a real army, and the population should be getting used.
   assert(army.length >= 25, `it fields a real army (${army.length})`);
-  assert(peakPop >= 0.85,
-    `it uses the population it has (peaked at ${Math.round(peakPop * 100)}% of the cap)`);
+  assert(peakPop[k] >= 0.85,
+    `it uses the population it has (peaked at ${Math.round(peakPop[k] * 100)}% of the cap)`);
   // Siege is support, not the army: a Siege Workshop can only train siege, so
   // without a share cap it queued rams forever and reached 62% of the army.
   assert(siege <= army.length * 0.25,
@@ -496,6 +643,267 @@ console.log('\n=== AI booms to a real Imperial army ===');
   const base = army.filter((u) => ['militia', 'spearman', 'archer', 'scoutCavalry'].includes(u.type)).length;
   assert(base <= army.length * 0.5,
     `most of the army is upgraded units, not the base tier (${base}/${army.length} base)`);
+}
+
+/* ---------------- the priority network ---------------- */
+
+console.log('\n=== The priority network reads the game ===');
+{
+  // The network itself is checked exhaustively against hand-built states by
+  // scripts/ai-brain-check.mjs. What matters here is the other half: that the
+  // features feeding it are actually wired to the game, so a real situation
+  // moves the real priorities.
+  const build = (setup) => {
+    const g = new Game({ seed: 77, mapSize: 80, players: [
+      { civ: 'britons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+    const p = g.players[0];
+    for (const a of ['feudalAge', 'castleAge']) g.completeResearch(p, a);
+    p.res = { food: 600, wood: 600, gold: 400, stone: 400 };
+    const s = g.map.starts[0];
+    for (let i = 0; i < 25; i++) g.spawnUnit('villager', 0, s.x + 3 + (i % 5), s.y + 3 + ((i / 5) | 0));
+    setup(g, s);
+    g._rebuildGrid();
+    g._recomputeFog();
+    const ai = new AI(g, 0, 'moderate');
+    ai.cacheState();
+    return ai;
+  };
+
+  const calm = build(() => {});
+  const raided = build((g, s) => {
+    for (let i = 0; i < 10; i++) g.spawnUnit('knight', 1, s.x + 6 + (i % 4), s.y + 6 + ((i / 4) | 0));
+  });
+
+  assert(raided.pri('defense') > calm.pri('defense'),
+    `an army in the town raises defence (${calm.pri('defense').toFixed(2)} -> ${raided.pri('defense').toFixed(2)})`);
+  assert(raided.pri('military') > calm.pri('military'),
+    `and military production (${calm.pri('military').toFixed(2)} -> ${raided.pri('military').toFixed(2)})`);
+  assert(raided.pri('boom') < calm.pri('boom'),
+    `while the boom is put on hold (${calm.pri('boom').toFixed(2)} -> ${raided.pri('boom').toFixed(2)})`);
+  assert(raided.pri('forwardCastle') < 0.35,
+    `and a Castle in their base is off the table (${raided.pri('forwardCastle').toFixed(2)})`);
+
+  // The four gather weights are network outputs, so they have to answer the
+  // bank rather than being a fixed per-age table.
+  const poor = build(() => {});
+  poor.p.res = { food: 20, wood: 600, gold: 900, stone: 900 };
+  poor.cacheState();
+  const rich = build(() => {});
+  rich.p.res = { food: 1600, wood: 600, gold: 60, stone: 900 };
+  rich.cacheState();
+  assert(poor.resourceDemand().food > rich.resourceDemand().food,
+    `an empty granary pulls villagers onto food ` +
+    `(${poor.resourceDemand().food.toFixed(2)} vs ${rich.resourceDemand().food.toFixed(2)})`);
+  assert(rich.resourceDemand().gold > poor.resourceDemand().gold,
+    `and an empty treasury onto gold ` +
+    `(${rich.resourceDemand().gold.toFixed(2)} vs ${poor.resourceDemand().gold.toFixed(2)})`);
+
+  // Nothing in the Dark Age costs gold or stone, and mining them there was
+  // costing the AI four minutes on its Feudal time.
+  const dark = new Game({ seed: 78, mapSize: 80, players: [{ civ: 'britons', name: 'A', team: 0 }] });
+  const darkAI = new AI(dark, 0, 'moderate');
+  darkAI.cacheState();
+  const ds = darkAI.resourceDemand();
+  assert(ds.food + ds.wood > 0.8,
+    `the Dark Age gathers food and wood almost exclusively ` +
+    `(food ${ds.food.toFixed(2)}, wood ${ds.wood.toFixed(2)}, ` +
+    `gold ${ds.gold.toFixed(2)}, stone ${ds.stone.toFixed(2)})`);
+}
+
+/* ---------------- trade ---------------- */
+
+console.log('\n=== Late game, it trades ===');
+{
+  // An Imperial economy with the gold mined out. Trade Carts are the only
+  // renewable gold in the game, so this is the difference between a long game
+  // that stays playable and one that quietly stops being one.
+  const g = new Game({ seed: 91, mapSize: 100, players: [{ civ: 'britons', name: 'A', team: 0 }] });
+  const p = g.players[0];
+  for (const a of ['feudalAge', 'castleAge', 'imperialAge']) g.completeResearch(p, a);
+  const s = g.map.starts[0];
+  for (const e of g.entities) {
+    if (e.alive && e.kind === 'resource' && e.resType === 'gold') e.alive = false;
+  }
+  // The gold in the ground is gone; the gold in the bank is what an Imperial
+  // economy would actually have reached this point holding. Starting at zero
+  // would test a bootstrap problem rather than the trade decision - a Trade
+  // Cart costs 50 gold, so with none at all there is no first cart.
+  p.res.gold = 400;
+  for (let i = 0; i < 40; i++) g.spawnUnit('villager', 0, s.x + 4 + (i % 8), s.y + 4 + ((i / 8) | 0));
+  g._rebuildGrid();
+  const ai = new AI(g, 0, 'moderate');
+
+  let markets = 0, carts = 0, trading = 0, goldFromTrade = 0;
+  for (let i = 0; i < Math.round(40 * 60 / TICK); i++) {
+    // Kept solvent in wood and food so this measures the trade decision rather
+    // than a starving economy.
+    if (i % 200 === 0) { p.res.wood += 400; p.res.food += 400; }
+    const before = p.res.gold;
+    g.update(TICK);
+    if (p.res.gold > before) goldFromTrade += p.res.gold - before;
+    if (i % 20 === 0) ai.update(1);
+    if (i % 100 === 0) {
+      markets = Math.max(markets, g.entities.filter((e) =>
+        e.alive && e.owner === 0 && e.type === 'market' && e.complete).length);
+      const live = g.entities.filter((e) =>
+        e.alive && e.owner === 0 && e.kind === 'unit' && e.def.cat === 'trade');
+      carts = Math.max(carts, live.length);
+      trading = Math.max(trading, live.filter((c) => c.task.type === 'trade').length);
+    }
+  }
+  assert(markets >= 2, `it builds a second Market to trade with (${markets})`);
+  assert(carts >= 4, `and puts a real fleet of Trade Carts on the road (${carts})`);
+  assert(trading >= 3, `which are actually running the route (${trading} trading at once)`);
+  assert(goldFromTrade > 400,
+    `so gold keeps arriving with no mine left (${Math.round(goldFromTrade)} delivered)`);
+}
+
+/* ---------------- allied AIs ---------------- */
+
+console.log('\n=== Allied AIs play as a team ===');
+{
+  const g = new Game({ seed: 4242, mapSize: 140, players: [
+    { civ: 'britons', name: 'A1', team: 0 },
+    { civ: 'franks', name: 'A2', team: 0 },
+    { civ: 'mongols', name: 'B1', team: 1 },
+    { civ: 'teutons', name: 'B2', team: 1 }] });
+  const ais = g.players.map((_, i) => new AI(g, i, 'moderate'));
+
+  assert(ais[0].team === ais[1].team, 'allies share one TeamBrain');
+  assert(ais[0].team !== ais[2].team, 'and enemies do not');
+
+  let tributes = 0;
+  const realTribute = g.tribute.bind(g);
+  g.tribute = (a, b, r, n) => { const sent = realTribute(a, b, r, n); if (sent) tributes++; return sent; };
+
+  let sameFocus = 0, samples = 0, allyTrade = 0;
+  const roles = new Set();
+  for (let i = 0; i < Math.round(40 * 60 / TICK); i++) {
+    g.update(TICK);
+    if (i % 20 === 0) for (const a of ais) a.update(1);
+    if (i % 400 === 0 && g.time > 600) {
+      samples++;
+      const f0 = ais[0].team.focus, f1 = ais[1].team.focus;
+      if (f0 && f1 && f0.player.index === f1.player.index) sameFocus++;
+      for (const a of ais) roles.add(a.team.roleOf(a));
+      for (const c of g.entities) {
+        if (!c.alive || c.kind !== 'unit' || c.def.cat !== 'trade') continue;
+        if (c.task.type !== 'trade') continue;
+        const m = g.get(c.task.marketId);
+        if (m && m.owner !== c.owner && g.isAlly(m.owner, c.owner)) allyTrade++;
+      }
+    }
+    if (g.over) break;
+  }
+
+  assert(samples > 0, `the team game ran long enough to measure (${samples} samples)`);
+  // Not every single sample: the team re-picks its target on its own clock, so
+  // a sample can land in the tick between one member reading the new focus and
+  // the other one doing so.
+  assert(sameFocus >= samples * 0.95,
+    `allies agree which enemy to attack (${sameFocus}/${samples} samples)`);
+  assert(roles.has('vanguard') && roles.has('quartermaster'),
+    `the team splits into different jobs (${[...roles].join(', ')})`);
+  assert(allyTrade > 0,
+    `Trade Carts run to an ally's Market, which is where the gold is (${allyTrade} observations)`);
+  assert(tributes > 0, `and a rich ally bails out a poor one (${tributes} tributes)`);
+}
+
+/* ---------------- castle siting ---------------- */
+
+console.log('\n=== Castles are placed on purpose ===');
+{
+  const setup = (extra) => {
+    const g = new Game({ seed: 63, mapSize: 100, players: [
+      { civ: 'britons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+    const p = g.players[0];
+    for (const a of ['feudalAge', 'castleAge']) g.completeResearch(p, a);
+    p.res = { food: 800, wood: 800, gold: 500, stone: 900 };
+    const s = g.map.starts[0];
+    for (let i = 0; i < 30; i++) g.spawnUnit('villager', 0, s.x + 3 + (i % 6), s.y + 3 + ((i / 6) | 0));
+    extra(g, s, g.map.starts[1]);
+    g._rebuildGrid();
+    g.revealAll = true;
+    g._recomputeFog();
+    const ai = new AI(g, 0, 'moderate');
+    ai.cacheState();
+    return { g, ai, enemy: g.map.starts[1] };
+  };
+
+  // Defensive: over our own economy, and at home.
+  const home = setup(() => {});
+  const defSpot = home.ai.findDefensiveCastleSpot();
+  assert(!!defSpot, 'it picks a defensive Castle site');
+  if (defSpot) {
+    const toHome = Math.hypot(defSpot.x - home.ai.homeX, defSpot.y - home.ai.homeY);
+    assert(toHome < 40, `sited over our own town (${toHome.toFixed(1)} tiles from the Town Center)`);
+    const covered = home.ai.mine.villagers.filter((v) =>
+      Math.hypot(v.x - defSpot.x, v.y - defSpot.y) < 12).length;
+    assert(covered >= 5, `and covering the economy (${covered} villagers inside its range)`);
+  }
+
+  // Aggressive: only with an army already standing out there to protect it.
+  const noArmy = setup(() => {});
+  assert(noArmy.ai.findForwardCastleSpot() === null,
+    'no forward Castle without an army to protect the build');
+
+  const withArmy = setup((g, s, e) => {
+    for (let i = 0; i < 14; i++) {
+      g.spawnUnit('knight', 0, e.x - 12 + (i % 5), e.y - 12 + ((i / 5) | 0));
+    }
+  });
+  const fwd = withArmy.ai.findForwardCastleSpot();
+  assert(!!fwd, 'with an army in their half, it picks a forward Castle site');
+  if (fwd) {
+    const toThem = Math.hypot(fwd.x - withArmy.enemy.x, fwd.y - withArmy.enemy.y);
+    const toUs = Math.hypot(fwd.x - withArmy.ai.homeX, fwd.y - withArmy.ai.homeY);
+    assert(toThem < toUs,
+      `and it is in their half, not ours (${toThem.toFixed(0)} vs ${toUs.toFixed(0)} tiles)`);
+  }
+}
+
+/* ---------------- answering the attacker ---------------- */
+
+console.log('\n=== It answers what is actually attacking it ===');
+{
+  // The same enemy army, once at the far edge of the map and once in our town,
+  // both fully visible. What is hitting the town should shape the build more
+  // than what was merely spotted somewhere.
+  const compWith = (inOurTown) => {
+    const g = new Game({ seed: 5, mapSize: 90, players: [
+      { civ: 'britons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+    const p = g.players[0];
+    for (const a of ['feudalAge', 'castleAge', 'imperialAge']) g.completeResearch(p, a);
+    for (const t of ['upPikeman', 'upHalberdier', 'upCrossbowman', 'upArbalester',
+      'upEliteSkirmisher', 'upLightCavalry', 'upHussar']) {
+      if (p.isTechAvailable(t)) g.completeResearch(p, t);
+    }
+    const s = g.map.starts[0];
+    for (let i = 0; i < 12; i++) g.spawnUnit('arbalester', 0, s.x - 4 + (i % 4), s.y - 4 + ((i / 4) | 0));
+    const ex = inOurTown ? s.x + 5 : Math.min(g.size - 6, s.x + 45);
+    const ey = inOurTown ? s.y + 5 : Math.min(g.size - 6, s.y + 45);
+    for (let i = 0; i < 10; i++) g.spawnUnit('knight', 1, ex + (i % 4) * 0.7, ey + ((i / 4) | 0) * 0.7);
+    g._rebuildGrid();
+    g.revealAll = true;          // equally visible either way; only distance differs
+    g._recomputeFog();
+    const ai = new AI(g, 0, 'moderate');
+    ai.cacheState();
+    const anti = ai.desiredComposition()
+      .filter((w) => ['halberdier', 'pikeman', 'spearman'].includes(w.id))
+      .reduce((t, w) => t + w.share, 0);
+    return { anti, counter: ai.pri('counter') };
+  };
+
+  const far = compWith(false);
+  const near = compWith(true);
+  assert(near.anti > 0.2,
+    `Knights in the town are answered with Halberdiers (${(near.anti * 100).toFixed(0)}% of the plan)`);
+  assert(near.anti > far.anti,
+    `and more so than the same army sitting far away ` +
+    `(${(near.anti * 100).toFixed(0)}% vs ${(far.anti * 100).toFixed(0)}%)`);
+  assert(near.counter > far.counter,
+    `because being hit is what raises the counter priority ` +
+    `(${far.counter.toFixed(2)} -> ${near.counter.toFixed(2)})`);
 }
 
 /* ---------------- unit upgrade lines ---------------- */
@@ -592,11 +1000,268 @@ console.log('\n=== Under attack, it builds a Castle ===');
   assert(!calm.committed, 'a peaceful AI does not panic-build one');
   assert(attacked.castleAt !== null,
     `the Castle actually gets laid (${attacked.castleAt ? attacked.castleAt.toFixed(1) + 'm' : 'never'})`);
-  assert(attacked.peakMiners > calm.peakMiners,
-    `villagers are switched onto stone for it (${attacked.peakMiners} vs ${calm.peakMiners} miners)`);
+  // Absolute, not relative to the calm run: a peaceful AI also mines stone for
+  // the Castles it wants anyway, so comparing the two no longer isolates the
+  // emergency response. What matters is that real labour goes onto stone.
+  assert(attacked.peakMiners >= 8,
+    `villagers are switched onto stone for it (${attacked.peakMiners} miners at peak)`);
   assert(calm.castleAt === null || attacked.castleAt < calm.castleAt,
     `and it is up sooner than it otherwise would be ` +
     `(${attacked.castleAt.toFixed(1)}m vs ${calm.castleAt ? calm.castleAt.toFixed(1) + 'm' : 'never'})`);
+}
+
+/* ---------------- camps follow the villagers ---------------- */
+
+console.log('\n=== A long haul earns a closer camp ===');
+{
+  // A crew of woodcutters working a forest far from any drop-off. The AI
+  // should notice the walk and plant a Lumber Camp on top of them, rather than
+  // leaving them hauling across the map for the rest of the game.
+  const g = new Game({ seed: 21, mapSize: 80, players: [{ civ: 'britons', name: 'A', team: 0 }] });
+  const p = g.players[0];
+  g.completeResearch(p, 'feudalAge');
+  p.res = { food: 500, wood: 500, gold: 200, stone: 200 };
+  const s = g.map.starts[0];
+
+  // Strip every tree near the town, so the only wood left is a long walk away.
+  // Without this the AI simply re-tasks the crew onto closer trees - which is
+  // correct, and means the long haul this feature exists for never happens.
+  const fx = Math.min(g.size - 10, s.x + 24), fy = Math.min(g.size - 10, s.y + 6);
+  for (const e of g.entities) {
+    if (e.alive && e.kind === 'resource' && e.type === 'tree' &&
+        Math.hypot(e.x - s.x, e.y - s.y) < 20) {
+      e.alive = false;
+      g.grid.blocked[(e.y | 0) * g.size + (e.x | 0)] = 0;
+    }
+  }
+  const trees = [];
+  for (let y = fy; y < fy + 5; y++) {
+    for (let x = fx; x < fx + 5; x++) {
+      const t = makeResource('tree', x + 0.5, y + 0.5, 100);
+      g.addEntity(t);
+      g.grid.blocked[y * g.size + x] = 1;
+      trees.push(t);
+    }
+  }
+  const crew = [];
+  for (let i = 0; i < 8; i++) crew.push(g.spawnUnit('villager', 0, s.x + 2 + (i % 4), s.y + 2 + ((i / 4) | 0)));
+  g._rebuildGrid();
+  for (let i = 0; i < crew.length; i++) g.commandGather([crew[i]], trees[i]);
+
+  const ai = new AI(g, 0, 'moderate');
+  // The AI also plants camps at un-served clusters near home, so this looks
+  // specifically for one that lands on the distant forest - that is the
+  // behaviour under test.
+  // Waits for a *finished* camp: a foundation is not a drop-off, so breaking
+  // out the moment one is laid measures the haul before anything changed.
+  const nearForest = () => g.entities.find((e) => e.alive && e.owner === 0 &&
+    e.type === 'lumberCamp' && e.complete && Math.hypot(e.x - (fx + 2), e.y - (fy + 2)) < 8);
+  let camp = null;
+  for (let i = 0; i < Math.round(14 * 60 / TICK) && !camp; i++) {
+    g.update(TICK);
+    if (i % 20 === 0) ai.update(1);
+    camp = nearForest();
+  }
+  assert(!!camp, 'a Lumber Camp is planted on the distant forest');
+  if (camp) {
+    const toForest = Math.hypot(camp.x - (fx + 2), camp.y - (fy + 2));
+    const toHome = Math.hypot(camp.x - s.x, camp.y - s.y);
+    assert(toForest < toHome,
+      `and it is nearer the work than the town (${toForest.toFixed(1)} vs ${toHome.toFixed(1)} tiles)`);
+    // The point of the whole exercise: the haul from those trees is now short.
+    ai.cacheState();
+    assert(ai.dropDist(fx + 2, fy + 2, 'wood') < AI.REHOME_DISTANCE,
+      `the crew's haul is now short (${ai.dropDist(fx + 2, fy + 2, 'wood').toFixed(1)} tiles)`);
+  }
+}
+
+/* ---------------- unique units and the population cap ---------------- */
+
+console.log('\n=== Unique units, and spending at the cap ===');
+{
+  const g = new Game({ seed: 31, mapSize: 80, players: [
+    { civ: 'teutons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+  const p = g.players[0];
+  for (const a of ['feudalAge', 'castleAge']) g.completeResearch(p, a);
+  const s = g.map.starts[0];
+  const ai = new AI(g, 0, 'moderate');
+
+  // With a Castle up, the unique unit has to be a real part of the plan.
+  g.placeBuilding('castle', 0, s.x + 6, s.y + 6, true);
+  g._rebuildGrid();
+  ai.cacheState();
+  const want = ai.desiredComposition().find((w) => w.id === p.civ.uu || w.id === p.civ.uuElite);
+  assert(!!want && want.share >= 0.15,
+    `the unique unit is a real share of the army (${want ? Math.round(want.share * 100) + '%' : 'absent'})`);
+
+  // A second Castle should raise it further - each one is another producer.
+  g.placeBuilding('castle', 0, s.x - 8, s.y + 6, true);
+  g._rebuildGrid();
+  ai.cacheState();
+  const want2 = ai.desiredComposition().find((w) => w.id === p.civ.uu || w.id === p.civ.uuElite);
+  assert(want2.share > want.share,
+    `a second Castle asks for more of them (${Math.round(want.share * 100)}% -> ${Math.round(want2.share * 100)}%)`);
+
+  // At the population cap, research opens right up: there is nothing else to buy.
+  p.res = { food: 5000, wood: 5000, gold: 5000, stone: 3000 };
+  for (const b of ['blacksmith', 'university', 'market', 'mill', 'lumberCamp', 'miningCamp']) {
+    g.placeBuilding(b, 0, s.x + 10 + Math.random() * 2, s.y - 8, true);
+  }
+  g._rebuildGrid();
+  ai.cacheState();
+  const beforeQ = () => ai.mine.buildings.reduce((n, b) =>
+    n + b.queue.filter((q) => q.kind === 'tech').length, 0);
+  ai.planReserve();
+  ai.manageResearch();
+  const normal = beforeQ();
+
+  // Now pin the population at the cap and try again.
+  const g2 = new Game({ seed: 31, mapSize: 80, players: [
+    { civ: 'teutons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+  const p2 = g2.players[0];
+  for (const a of ['feudalAge', 'castleAge']) g2.completeResearch(p2, a);
+  p2.res = { food: 5000, wood: 5000, gold: 5000, stone: 3000 };
+  const s2 = g2.map.starts[0];
+  for (const b of ['blacksmith', 'university', 'market', 'mill', 'lumberCamp', 'miningCamp']) {
+    g2.placeBuilding(b, 0, s2.x + 10 + Math.random() * 2, s2.y - 8, true);
+  }
+  g2._rebuildGrid();
+  const ai2 = new AI(g2, 0, 'moderate');
+  ai2.cacheState();
+  // At the real limit, not merely short of Houses - the AI distinguishes the
+  // two, because a housing block is temporary and the game's cap is not.
+  p2.popCap = p2.popMax;
+  p2.pop = p2.effectivePopCap;
+  ai2.planReserve();
+  ai2.manageResearch();
+  const capped = ai2.mine.buildings.reduce((n, b) =>
+    n + b.queue.filter((q) => q.kind === 'tech').length, 0);
+
+  assert(capped > normal,
+    `at the population cap it researches far more at once (${normal} -> ${capped} queued)`);
+  assert(capped >= 4, `and it really is a sweep, not one extra (${capped} techs queued)`);
+}
+
+/* ---------------- economy upgrade timing ---------------- */
+
+console.log('\n=== Wheelbarrow and Hand Cart are timed ===');
+{
+  // Both are a flat cost buying a small per-villager gain, so buying them early
+  // spends food that would have been villagers. Watch when the AI actually
+  // takes them.
+  const g = new Game({ seed: 2554, mapSize: 120, players: [
+    { civ: 'britons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+  const ais = [new AI(g, 0, 'moderate'), new AI(g, 1, 'moderate')];
+  const p = g.players[0];
+  const at = {};
+  const countVills = () => g.entities.filter((e) => e.alive && e.owner === 0 &&
+    e.kind === 'unit' && e.def.cat === 'villager').length;
+  const countFarms = () => g.entities.filter((e) => e.alive && e.owner === 0 &&
+    e.type === 'farm').length;
+
+  // Peak villagers, not the count at the moment it finishes: research takes up
+  // to 75 seconds and a raid during it would otherwise read as the AI having
+  // bought the tech early. What is being tested is the size of economy that
+  // triggered the decision.
+  let peak = 0;
+  for (let i = 0; i < Math.round(60 * 60 / TICK); i++) {
+    g.update(TICK);
+    if (i % 20 === 0) for (const a of ais) a.update(1);
+    if (i % 40 === 0) peak = Math.max(peak, countVills());
+    for (const t of ['wheelbarrow', 'handCart']) {
+      if (!at[t] && p.researched.has(t)) {
+        at[t] = { vills: Math.max(peak, countVills()), farms: countFarms() };
+      }
+    }
+    if (at.wheelbarrow && at.handCart) break;
+  }
+
+  assert(!!at.wheelbarrow, 'Wheelbarrow gets researched at all');
+  if (at.wheelbarrow) {
+    assert(at.wheelbarrow.vills >= 40 || at.wheelbarrow.farms >= 17,
+      `Wheelbarrow waits for the economy to earn it back ` +
+      `(${at.wheelbarrow.vills} villagers, ${at.wheelbarrow.farms} farms)`);
+  }
+  assert(!!at.handCart, 'Hand Cart gets researched at all');
+  if (at.handCart) {
+    assert(at.handCart.vills >= 60,
+      `Hand Cart waits for a bigger one still (${at.handCart.vills} villagers)`);
+    assert(at.handCart.vills >= at.wheelbarrow.vills,
+      `and it comes after Wheelbarrow (${at.wheelbarrow.vills} -> ${at.handCart.vills})`);
+  }
+}
+
+/* ---------------- villagers avoid dangerous ground ---------------- */
+
+console.log('\n=== Villagers avoid dangerous ground ===');
+{
+  // Two equal woodlines the same distance either side of the town, and only
+  // enough trees in each that both are needed. Then put an enemy Castle over
+  // one of them and see where the villagers go.
+  const run = (withCastle) => {
+    const g = new Game({ seed: 55, mapSize: 90, players: [
+      { civ: 'britons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+    const p = g.players[0];
+    g.completeResearch(p, 'feudalAge');
+    p.res = { food: 600, wood: 600, gold: 300, stone: 300 };
+    const s = g.map.starts[0];
+    for (const e of g.entities) {
+      if (e.alive && e.kind === 'resource' && e.type === 'tree' &&
+          Math.hypot(e.x - s.x, e.y - s.y) < 26) {
+        e.alive = false;
+        g.grid.blocked[(e.y | 0) * g.size + (e.x | 0)] = 0;
+      }
+    }
+    const plant = (px, py) => {
+      const out = [];
+      for (let y = py; y < py + 3; y++) {
+        for (let x = px; x < px + 3; x++) {
+          if (x < 1 || y < 1 || x >= g.size - 1 || y >= g.size - 1) continue;
+          const t = makeResource('tree', x + 0.5, y + 0.5, 175);
+          g.addEntity(t);
+          g.grid.blocked[y * g.size + x] = 1;
+          out.push(t);
+        }
+      }
+      return out;
+    };
+    const safe = plant(Math.max(2, s.x - 15), s.y);
+    const risky = plant(Math.min(g.size - 6, s.x + 15), s.y);
+    if (withCastle) g.placeBuilding('castle', 1, Math.min(g.size - 7, s.x + 19), s.y, true);
+    for (let i = 0; i < 20; i++) g.spawnUnit('villager', 0, s.x + 1 + (i % 4), s.y + 1 + ((i / 4) | 0));
+    g._rebuildGrid();
+    g._recomputeFog();
+    const ai = new AI(g, 0, 'moderate');
+    const safeIds = new Set(safe.map((t) => t.id));
+    const riskyIds = new Set(risky.map((t) => t.id));
+    let onSafe = 0, onRisky = 0;
+    for (let i = 0; i < Math.round(6 * 60 / TICK); i++) {
+      g.update(TICK);
+      if (i % 20 === 0) ai.update(1);
+      if (i % 200 !== 0 || g.time < 60) continue;
+      for (const e of g.entities) {
+        if (!e.alive || e.owner !== 0 || e.kind !== 'unit' || e.def.cat !== 'villager') continue;
+        if (e.task.type !== 'gather' || !e.task.targetId) continue;
+        if (safeIds.has(e.task.targetId)) onSafe++;
+        else if (riskyIds.has(e.task.targetId)) onRisky++;
+      }
+    }
+    return { onSafe, onRisky };
+  };
+
+  const open = run(false);
+  const covered = run(true);
+  // Relative to the unthreatened run, not a fixed number: the exact split
+  // depends on the surrounding map, which shifts whenever map generation
+  // changes. What has to hold is that the second woodline is genuinely in use
+  // to begin with, and that the Castle then empties it.
+  assert(open.onRisky > open.onSafe * 0.15,
+    `with no threat both woodlines get worked (${open.onSafe} vs ${open.onRisky})`);
+  assert(covered.onRisky < open.onRisky * 0.5,
+    `an enemy Castle over one drives the villagers off it ` +
+    `(${open.onRisky} -> ${covered.onRisky} villager-observations)`);
+  assert(covered.onSafe > covered.onRisky * 3,
+    `they crowd the safe woodline instead (${covered.onSafe} vs ${covered.onRisky})`);
 }
 
 console.log('\n=== Unit upgrade lines ===');

@@ -86,6 +86,10 @@ export function applyDamage(game, target, dmg, attacker) {
   }
   target.hp -= dmg;
   target.lastDamaged = game.time;
+  // Who did it, so the target can hit back and so anything nearby can be told
+  // where the trouble is. Without this a unit under fire knows only that it is
+  // being hurt, not by whom, and can do nothing about it.
+  if (attacker && game.isEnemy(target.owner, attacker.owner)) target.lastAttacker = attacker.id;
   if (attacker && attacker.kind === 'unit') {
     // Poles Obuch shreds armour on hit
     if (attacker.def.shredArmor && target.kind === 'unit') {
