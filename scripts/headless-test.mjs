@@ -633,7 +633,7 @@ console.log('\n=== AI booms to a real Imperial army ===');
     `siege stays a support arm (${siege}/${army.length} = ${Math.round(siege / Math.max(1, army.length) * 100)}%)`);
   assert(p.stats.unitsKilled > 0, `the army is actually used (${p.stats.unitsKilled} kills)`);
 
-  const idle = vills.filter((v) => v.task.type === 'idle').length;
+  const idle = vills.filter((v) => v.task.type === 'idle' && !v.garrisonedIn).length;
   assert(idle <= Math.max(2, vills.length * 0.05), `still no idle villagers (${idle}/${vills.length})`);
 
   // Now that lines have to be walked up one tier at a time, an AI that never
@@ -712,50 +712,85 @@ console.log('\n=== The priority network reads the game ===');
 
 /* ---------------- trade ---------------- */
 
-console.log('\n=== Late game, it trades ===');
+console.log('\n=== Late game, allies trade ===');
 {
-  // An Imperial economy with the gold mined out. Trade Carts are the only
-  // renewable gold in the game, so this is the difference between a long game
-  // that stays playable and one that quietly stops being one.
-  const g = new Game({ seed: 91, mapSize: 100, players: [{ civ: 'britons', name: 'A', team: 0 }] });
-  const p = g.players[0];
-  for (const a of ['feudalAge', 'castleAge', 'imperialAge']) g.completeResearch(p, a);
-  const s = g.map.starts[0];
+  // Two allies with the gold mined out. Trade Carts are the only renewable gold
+  // in the game, so this is the difference between a long game that stays
+  // playable and one that quietly stops being one - and it is deliberately only
+  // available to a team, because a route between two of your own Markets would
+  // manufacture gold out of walking distance with no partner to cut off.
+  const g = new Game({ seed: 91, mapSize: 140, players: [
+    { civ: 'britons', name: 'A1', team: 0 },
+    { civ: 'franks', name: 'A2', team: 0 },
+    { civ: 'mongols', name: 'B1', team: 1 }] });
+  for (const p of g.players.slice(0, 2)) {
+    for (const a of ['feudalAge', 'castleAge', 'imperialAge']) g.completeResearch(p, a);
+    p.res.gold = 400;
+  }
   for (const e of g.entities) {
     if (e.alive && e.kind === 'resource' && e.resType === 'gold') e.alive = false;
   }
-  // The gold in the ground is gone; the gold in the bank is what an Imperial
-  // economy would actually have reached this point holding. Starting at zero
-  // would test a bootstrap problem rather than the trade decision - a Trade
-  // Cart costs 50 gold, so with none at all there is no first cart.
-  p.res.gold = 400;
-  for (let i = 0; i < 40; i++) g.spawnUnit('villager', 0, s.x + 4 + (i % 8), s.y + 4 + ((i / 8) | 0));
+  for (let i = 0; i < 2; i++) {
+    const s = g.map.starts[i];
+    for (let n = 0; n < 40; n++) g.spawnUnit('villager', i, s.x + 4 + (n % 8), s.y + 4 + ((n / 8) | 0));
+  }
   g._rebuildGrid();
-  const ai = new AI(g, 0, 'moderate');
+  const ais = g.players.map((_, i) => new AI(g, i, 'moderate'));
 
-  let markets = 0, carts = 0, trading = 0, goldFromTrade = 0;
+  let carts = 0, allyRuns = 0, goldFromTrade = 0, selfRuns = 0;
   for (let i = 0; i < Math.round(40 * 60 / TICK); i++) {
     // Kept solvent in wood and food so this measures the trade decision rather
     // than a starving economy.
-    if (i % 200 === 0) { p.res.wood += 400; p.res.food += 400; }
-    const before = p.res.gold;
+    if (i % 200 === 0) for (const p of g.players.slice(0, 2)) { p.res.wood += 400; p.res.food += 400; }
+    const before = g.players[0].res.gold;
     g.update(TICK);
-    if (p.res.gold > before) goldFromTrade += p.res.gold - before;
-    if (i % 20 === 0) ai.update(1);
+    if (g.players[0].res.gold > before) goldFromTrade += g.players[0].res.gold - before;
+    if (i % 20 === 0) for (const a of ais) a.update(1);
     if (i % 100 === 0) {
-      markets = Math.max(markets, g.entities.filter((e) =>
-        e.alive && e.owner === 0 && e.type === 'market' && e.complete).length);
-      const live = g.entities.filter((e) =>
-        e.alive && e.owner === 0 && e.kind === 'unit' && e.def.cat === 'trade');
+      const live = g.entities.filter((e) => e.alive && e.owner === 0 &&
+        e.kind === 'unit' && e.def.cat === 'trade');
       carts = Math.max(carts, live.length);
-      trading = Math.max(trading, live.filter((c) => c.task.type === 'trade').length);
+      for (const c of live) {
+        if (c.task.type !== 'trade') continue;
+        const m = g.get(c.task.marketId);
+        if (!m) continue;
+        if (m.owner === c.owner) selfRuns++; else allyRuns++;
+      }
+    }
+    if (g.over) break;
+  }
+  assert(carts >= 4, `it puts a real fleet of Trade Carts on the road (${carts})`);
+  assert(allyRuns > 0, `and they run to the ally's Market (${allyRuns} observations)`);
+  assert(selfRuns === 0, `never to one of our own (${selfRuns} observations)`);
+  assert(goldFromTrade > 50,
+    `so gold keeps arriving with no mine left (${Math.round(goldFromTrade)} delivered)`);
+}
+
+console.log('\n=== A lone player cannot trade with itself ===');
+{
+  const g = new Game({ seed: 91, mapSize: 100, players: [{ civ: 'britons', name: 'A', team: 0 }] });
+  const p = g.players[0];
+  for (const a of ['feudalAge', 'castleAge', 'imperialAge']) g.completeResearch(p, a);
+  for (const e of g.entities) {
+    if (e.alive && e.kind === 'resource' && e.resType === 'gold') e.alive = false;
+  }
+  p.res.gold = 400;
+  const s = g.map.starts[0];
+  for (let i = 0; i < 40; i++) g.spawnUnit('villager', 0, s.x + 4 + (i % 8), s.y + 4 + ((i / 8) | 0));
+  g._rebuildGrid();
+  const ai = new AI(g, 0, 'moderate');
+  let carts = 0;
+  for (let i = 0; i < Math.round(25 * 60 / TICK); i++) {
+    if (i % 200 === 0) { p.res.wood += 400; p.res.food += 400; }
+    g.update(TICK);
+    if (i % 20 === 0) ai.update(1);
+    if (i % 200 === 0) {
+      carts = Math.max(carts, g.entities.filter((e) => e.alive && e.owner === 0 &&
+        e.kind === 'unit' && e.def.cat === 'trade').length);
     }
   }
-  assert(markets >= 2, `it builds a second Market to trade with (${markets})`);
-  assert(carts >= 4, `and puts a real fleet of Trade Carts on the road (${carts})`);
-  assert(trading >= 3, `which are actually running the route (${trading} trading at once)`);
-  assert(goldFromTrade > 400,
-    `so gold keeps arriving with no mine left (${Math.round(goldFromTrade)} delivered)`);
+  assert(carts === 0, `no Trade Carts with nobody to trade with (${carts})`);
+  assert(ai.tradePotential === null, 'and the AI knows there is no route to have');
 }
 
 /* ---------------- allied AIs ---------------- */
@@ -784,6 +819,10 @@ console.log('\n=== Allied AIs play as a team ===');
     if (i % 400 === 0 && g.time > 600) {
       samples++;
       const f0 = ais[0].team.focus, f1 = ais[1].team.focus;
+      // Allies share one TeamBrain, so a focus that exists is the same object
+      // for both of them. Samples where nobody has been scouted yet are not
+      // disagreements, they are simply nothing to agree about.
+      if (!f0 && !f1) { samples--; continue; }
       if (f0 && f1 && f0.player.index === f1.player.index) sameFocus++;
       for (const a of ais) roles.add(a.team.roleOf(a));
       for (const c of g.entities) {
@@ -800,8 +839,8 @@ console.log('\n=== Allied AIs play as a team ===');
   // Not every single sample: the team re-picks its target on its own clock, so
   // a sample can land in the tick between one member reading the new focus and
   // the other one doing so.
-  assert(sameFocus >= samples * 0.95,
-    `allies agree which enemy to attack (${sameFocus}/${samples} samples)`);
+  assert(sameFocus === samples,
+    `allies always agree which enemy to attack (${sameFocus}/${samples} samples)`);
   assert(roles.has('vanguard') && roles.has('quartermaster'),
     `the team splits into different jobs (${[...roles].join(', ')})`);
   assert(allyTrade > 0,
@@ -860,6 +899,125 @@ console.log('\n=== Castles are placed on purpose ===');
     assert(toThem < toUs,
       `and it is in their half, not ours (${toThem.toFixed(0)} vs ${toUs.toFixed(0)} tiles)`);
   }
+}
+
+/* ---------------- attacking a defended base ---------------- */
+
+console.log('\n=== It kills the defences before diving for the Town Center ===');
+{
+  // Their Town Center in the middle, two Castles covering the approach, and our
+  // army outside. Walking past the Castles to reach the Town Center is how an
+  // army feeds itself in one unit at a time.
+  const g = new Game({ seed: 71, mapSize: 100, players: [
+    { civ: 'britons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+  const p = g.players[0];
+  for (const a of ['feudalAge', 'castleAge']) g.completeResearch(p, a);
+  const home = g.map.starts[0];
+  // A compact enemy base well away from ours, laid out by hand.
+  const bx = Math.round((home.x + g.map.starts[1].x) / 2);
+  const by = Math.round((home.y + g.map.starts[1].y) / 2);
+  const tc = g.placeBuilding('townCenter', 1, bx, by, true);
+  const castleNear = g.placeBuilding('castle', 1, bx - 12, by, true);
+  g.placeBuilding('castle', 1, bx + 8, by, true);
+  g.placeBuilding('house', 1, bx - 3, by + 8, true);
+  // Our army parked outside, on the near Castle's side.
+  const army = [];
+  for (let i = 0; i < 16; i++) {
+    army.push(g.spawnUnit('knight', 0, bx - 22 + (i % 4), by - 2 + ((i / 4) | 0)));
+  }
+  g._rebuildGrid();
+  g.revealAll = true;
+  g._recomputeFog();
+  const ai = new AI(g, 0, 'moderate');
+  ai.cacheState();
+
+  assert(!!tc && !!castleNear, 'test fixture: a Town Center ringed by two Castles');
+
+  const target = ai.pickAttackTarget(army);
+  assert(!!target, 'the army is given a target');
+  if (target) {
+    assert(target.type !== 'townCenter',
+      `it does not march past the Castles for the Town Center (picked ${target.type})`);
+    assert(target.id === castleNear.id,
+      `it attacks the Castle on its own side of the base first (picked ${target.type})`);
+  }
+
+  // The cover reading is what drives it: the middle of the base is under two
+  // Castles, the near edge is under one.
+  const atTc = ai.enemyCoverAt(tc.x, tc.y);
+  const outside = ai.enemyCoverAt(bx - 22, by);
+  assert(atTc > outside,
+    `the Town Center reads as far better covered than open ground (${atTc} vs ${outside})`);
+
+  // And once the defences are gone the Town Center becomes the target.
+  g.kill(castleNear, null);
+  for (const e of g.entities) {
+    if (e.alive && e.owner === 1 && e.type === 'castle') g.kill(e, null);
+  }
+  g._rebuildGrid();
+  ai.cacheState();
+  const after = ai.pickAttackTarget(army);
+  assert(after && after.type === 'townCenter',
+    `with the Castles down it goes for the Town Center (picked ${after ? after.type : 'nothing'})`);
+}
+
+/* ---------------- raiding in several places at once ---------------- */
+
+console.log('\n=== Raids hit several places at once ===');
+{
+  // An enemy economy spread over three corners, and a big idle army of ours.
+  // One squad walking to one place is not a raid - it is a small attack the
+  // defender meets in one spot.
+  const g = new Game({ seed: 72, mapSize: 120, players: [
+    { civ: 'britons', name: 'A', team: 0 }, { civ: 'franks', name: 'B', team: 1 }] });
+  const p = g.players[0];
+  for (const a of ['feudalAge', 'castleAge']) g.completeResearch(p, a);
+  const home = g.map.starts[0];
+  // Three separate villager camps, well apart.
+  const spots = [[30, 30], [30, 90], [90, 30]];
+  for (const [sx, sy] of spots) {
+    for (let i = 0; i < 6; i++) g.spawnUnit('villager', 1, sx + (i % 3), sy + ((i / 3) | 0));
+  }
+  for (let i = 0; i < 40; i++) {
+    g.spawnUnit('knight', 0, home.x + 2 + (i % 6), home.y + 2 + ((i / 6) | 0));
+  }
+  g._rebuildGrid();
+  g.revealAll = true;
+  g._recomputeFog();
+  const ai = new AI(g, 0, 'moderate');
+  // Force the raiding priority up: what is under test is the squad handling,
+  // not the network's willingness to raid on this particular map.
+  ai.cacheState();
+  ai.brain.values.raid = 0.9;
+  ai.manageRaid();
+
+  const parties = ai.squads.raids;
+  assert(parties.length >= 2, `it forms more than one raiding party (${parties.length})`);
+  const sizes = parties.map((x) => x.ids.length);
+  assert(sizes.every((n) => n >= 3), `each party is a real group (${sizes.join(', ')})`);
+  const ids = new Set();
+  let overlap = 0;
+  for (const party of parties) for (const id of party.ids) {
+    if (ids.has(id)) overlap++;
+    ids.add(id);
+  }
+  assert(overlap === 0, `no unit is in two parties at once (${overlap} overlaps)`);
+
+  const targets = parties.map((x) => g.get(x.targetId)).filter(Boolean);
+  assert(targets.length === parties.length, 'every party is given a target');
+  if (targets.length >= 2) {
+    let closest = Infinity;
+    for (let i = 0; i < targets.length; i++) {
+      for (let j = i + 1; j < targets.length; j++) {
+        closest = Math.min(closest, Math.hypot(targets[i].x - targets[j].x, targets[i].y - targets[j].y));
+      }
+    }
+    assert(closest > 20,
+      `and they are sent to different parts of the map (${closest.toFixed(0)} tiles apart)`);
+  }
+  // The main army must not be raiding: waves and raids draw from one pool.
+  const raiders = ai.raiderIds();
+  assert(raiders.size < 40, `the main army is not all out raiding (${raiders.size}/40)`);
 }
 
 /* ---------------- answering the attacker ---------------- */
@@ -1426,7 +1584,11 @@ if (minutes >= 16) {
   assert(army0.length >= 1, `AI-A produced military units (${army0.length})`);
   // The AI is supposed to leave nobody standing around. A couple mid-walk
   // between jobs is normal; a tenth of the economy idle is a real failure.
-  const idle0 = vills0.filter((v) => v.task.type === 'idle').length;
+  // Garrisoned villagers report `idle` - that is how the sim models being
+  // inside a building - but they are sheltering from a raid on purpose, not
+  // standing about with nothing to do. Counting them made a working defensive
+  // response look like an economy bug.
+  const idle0 = vills0.filter((v) => v.task.type === 'idle' && !v.garrisonedIn).length;
   assert(idle0 <= Math.max(1, vills0.length * 0.1),
     `AI-A has no idle villagers (${idle0}/${vills0.length})`);
 }
