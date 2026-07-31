@@ -384,8 +384,55 @@ export class AI {
     }
     /** 0 when every pile is level, approaching 1 when one dwarfs another. */
     this.stockImbalance = hi > 0 ? 1 - lo / hi : 0;
-    /** Are we so far past needing resources that population is the constraint? */
-    this.glut = Math.min(r.food, r.wood, r.gold, r.stone);
+    /**
+     * The same reading in resources rather than as a ratio.
+     *
+     * A ratio on its own cannot tell the difference between the two cases that
+     * matter. Four hundred food beside forty gold is a ratio of ten and is
+     * simply what a working economy looks like from one second to the next;
+     * ninety thousand wood beside a thousand food is the same ratio and is a
+     * town that has been mining the wrong thing for half an hour. Only the
+     * absolute gap separates them, and only the second one is worth paying a
+     * walk across the map to correct.
+     */
+    this.stockSpread = hi - lo;
+    /**
+     * Are we so far past needing resources that population is the constraint?
+     *
+     * A resource that is no longer on the map is excluded, because it can no
+     * longer be a reason to keep gathering. Taking the plain minimum of all four
+     * meant a mined-out stone map pinned this at whatever stone happened to be
+     * left in the bank - and with it everything that depends on the bank being
+     * spendable. Traced 100-minute games sat at 500 of 500 population with a
+     * hundred and sixty thousand resources banked and 555 stone, and never once
+     * traded a villager for a soldier, because 555 is not a glut. Food is always
+     * gettable: farms are why the food economy never truly dries up.
+     */
+    let glut = r.food;
+    for (const k of ['wood', 'gold', 'stone']) {
+      const left = this.nodes[k].reduce((t, n) => t + (n.amount || 0), 0);
+      if (left >= 150) glut = Math.min(glut, r[k]);
+    }
+    this.glut = glut;
+
+    // How long that has been true *while there was nowhere to put the income*.
+    //
+    // Trading villagers for army is only right when both halves hold at once
+    // and keep holding: a bank that spikes past the mark for ten seconds after
+    // an age completes is not a glut, and a town that is briefly at its house
+    // limit is not out of room. Requiring both to persist is what separates
+    // "there is genuinely nothing left to buy" from an ordinary lull, and it is
+    // why a raid that kills thirty villagers cannot be followed by the AI
+    // finishing off the rest.
+    const capped = this.p.pop >= this.p.effectivePopCap - 2 &&
+      this.p.effectivePopCap >= this.p.popMax - this.share(0.025, 5);
+    if (this.glut > GLUT && capped) {
+      if (!this.glutSince) this.glutSince = this.game.time;
+    } else {
+      this.glutSince = 0;
+    }
+    /** Seconds the AI has been both maxed out and drowning, 0 when it is not. */
+    this.glutElapsed = this.glutSince ? this.game.time - this.glutSince : 0;
   }
 
   /**
@@ -642,6 +689,7 @@ export class AI {
   planReserve() {
     this.reserve = null;
     this.savingForAge = false;
+    this.savingForUpgrade = null;
     const a = this.p.ageIndex;
 
     // Being attacked outranks even the age. A Castle is the difference between
@@ -684,9 +732,24 @@ export class AI {
     }
     if (panic) { this.reserve = panic; return; }
 
+    // The upgrade fund shares with the two soft banks below rather than queueing
+    // behind them, on the same argument as the panic Castle and the age: they
+    // cost different resources. A Town Center is wood and stone and a Paladin is
+    // food and gold, so making the upgrade wait for the last Town Center of a
+    // twelve-Town-Center plan never bought a Town Center sooner - it simply meant
+    // the fund never got a turn at all, for the whole game.
+    const up = this.planUpgradeFund();
+    const withUpgrade = (cost) => {
+      if (!up) return cost;
+      const out = { ...cost };
+      for (const k in up.cost) out[k] = Math.max(out[k] || 0, up.cost[k] || 0);
+      this.savingForUpgrade = up.id;
+      return out;
+    };
+
     if (a >= 2 && this.count('townCenter') < this.townCenterTarget() &&
         !this.underConstruction('townCenter')) {
-      this.reserve = this.p.mods.building('townCenter').cost;
+      this.reserve = withUpgrade(this.p.mods.building('townCenter').cost);
       return;
     }
 
@@ -694,8 +757,78 @@ export class AI {
     // there when the unique unit becomes worth having rather than three minutes
     // after we decided we wanted it.
     if (this.wantsAnotherCastle() && this.pri('defCastle') > 0.5) {
-      this.reserve = this.p.mods.building('castle').cost;
+      this.reserve = withUpgrade(this.p.mods.building('castle').cost);
+      return;
     }
+
+    // Last of all, the top of a unit line on its own.
+    if (up) { this.reserve = up.cost; this.savingForUpgrade = up.id; }
+  }
+
+  /**
+   * The one expensive unit upgrade the AI is banking for, if any.
+   *
+   * The late upgrades are lumps on the scale of an age: Paladin is 1300 food
+   * and 750 gold, Champion 750 and 350, Siege Onager 1450 and 1000 wood. Income
+   * is spent the moment it lands - a soldier here, a House there - so a bank
+   * that size never assembles by accident, and traced 60-minute games finished
+   * in the Imperial Age with Cavaliers, having had Paladin available and
+   * affordable-in-total for half an hour. Everything cheaper is left to the
+   * ordinary research pass, which buys it out of pocket.
+   *
+   * The cheapest unaffordable one is the right target rather than the best: the
+   * lines are chained, so Cavalier has to be bought before Paladin can be, and
+   * banking for the nearest rung reaches the top of the line soonest.
+   */
+  planUpgradeFund() {
+    this.savingForUpgrade = null;
+    // Nothing this size is worth freezing production for before the Castle Age,
+    // and an AI that is being attacked buys soldiers, not upgrades.
+    if (this.p.ageIndex < 2) { this.upgradeSaveStart = 0; return null; }
+    if (this.pri('defense') > 0.6) { this.upgradeSaveStart = 0; return null; }
+    // And only once the population limit is what bounds the army rather than
+    // the bank. While there is still room to grow, a fund is strictly worse than
+    // the soldiers it holds back: measured over seven games it traded a third of
+    // the army for a hundred-food upgrade that made the rest slightly better.
+    // Near the cap that trade inverts - the food has nothing else to become.
+    if (this.p.pop < this.p.effectivePopCap - this.share(0.03, 5)) {
+      this.upgradeSaveStart = 0;
+      return null;
+    }
+    if (this.game.time < (this.upgradeSaveUntil || 0)) return null;
+
+    let best = null;
+    for (const id of this.unitUpgradeTechs()) {
+      if (!TECHS[id] || !this.p.isTechAvailable(id)) continue;
+      if (!this.buildingsOf(TECHS[id].building).length) continue;
+      const cost = this.p.mods.techCost(TECHS[id]);
+      const total = (cost.food || 0) + (cost.wood || 0) + (cost.gold || 0) + (cost.stone || 0);
+      if (total < AI.UPGRADE_FUND_MIN) continue;      // affordable out of pocket
+      if (this.p.canAfford(cost)) continue;            // already affordable: no fund needed
+      if (!best || total < best.total) best = { id, cost, total };
+    }
+    if (!best) { this.upgradeSaveStart = 0; return null; }
+
+    // A fund that never fills is worse than no fund: it holds army production
+    // behind a purchase the economy cannot reach. After a while it stands down,
+    // production resumes, and it tries again later with a bigger economy.
+    if (this.upgradeSaveGoal !== best.id) {
+      this.upgradeSaveGoal = best.id;
+      this.upgradeSaveStart = this.game.time;
+    }
+    // At the population cap the fund costs nothing to hold: there is no army to
+    // train with the food it is sitting on, which is the whole reason the late
+    // upgrades are the right thing to buy there. Patience elsewhere is short,
+    // because then the fund really is holding soldiers back.
+    const patience = this.p.pop >= this.p.effectivePopCap - 2
+      ? AI.UPGRADE_SAVE_PATIENCE * 4 : AI.UPGRADE_SAVE_PATIENCE;
+    if (this.game.time - this.upgradeSaveStart > patience) {
+      this.upgradeSaveUntil = this.game.time + AI.UPGRADE_SAVE_COOLDOWN;
+      this.upgradeSaveGoal = null;
+      this.upgradeSaveStart = 0;
+      return null;
+    }
+    return best;
   }
 
   /**
@@ -726,6 +859,16 @@ export class AI {
   /** How long a panic Castle may hold the whole economy hostage before the age
    *  takes priority back. */
   static EMERGENCY_CASTLE_PATIENCE = 240;
+  /** How long the bank and the population cap must both stay maxed before the
+   *  AI starts trading its surplus economy for army. */
+  static GLUT_PATIENCE = 120;
+  /** How long an upgrade fund may hold back production before it stands down. */
+  static UPGRADE_SAVE_PATIENCE = 210;
+  /** How long it stays stood down before trying for that upgrade again. */
+  static UPGRADE_SAVE_COOLDOWN = 120;
+  /** Total cost below which an upgrade is bought out of pocket rather than
+   *  banked for. Anything cheaper arrives on its own within a pass or two. */
+  static UPGRADE_FUND_MIN = 400;
 
   /** The villager count this age wants before advancing. */
   ageGate() { return ageGate(this.p.age, this.p.popMax); }
@@ -931,13 +1074,53 @@ export class AI {
    * onto another site, killed - and nothing put anyone back. The abandoned
    * foundation then counted as "housing already on the way" forever.
    */
+  /**
+   * How many villagers a foundation should have on it.
+   *
+   * Four for the big ones and two for everything else - both long-standing
+   * numbers, and both good. Only a Castle gets more, and only when it is
+   * actually needed: a Castle laid because the town is being overrun is a race
+   * against the raid that caused it. The 650 stone is already spent by that
+   * point, and a Castle that finishes after the attack is one that was never
+   * worth building.
+   *
+   * Scaling the *other* key buildings with the population limit measured badly.
+   * A big game lays Town Centers constantly, and six villagers a foundation
+   * instead of four came straight out of the gather rate for buildings that
+   * were going up fine either way - about six percent of the economy.
+   */
+  buildCrew(bId) {
+    if (bId !== 'castle') return (bId === 'townCenter' || bId === 'wonder') ? 4 : 2;
+    let crew = 4;
+    if (this.wantEmergencyCastle) crew = Math.round(this.share(0.06, 10));
+    else if (this.underThreat) crew = Math.round(this.share(0.035, 7));
+    // Never strip the economy bare for one building, however urgent - an
+    // unbuilt Castle loses a town slowly and an unworked map loses it anyway.
+    return Math.max(1, Math.min(crew, Math.floor(this.mine.villagers.length * 0.25)));
+  }
+
   manageConstruction() {
     const g = this.game;
     for (const b of this.mine.buildings) {
       if (b.complete) continue;
-      if (g.buildClaims.get(b.id)) continue;
-      const crew = (b.type === 'castle' || b.type === 'townCenter' || b.type === 'wonder') ? 4 : 2;
-      const builders = this.pickBuilders(b.x, b.y, crew);
+      const want = this.buildCrew(b.type);
+      const have = g.buildClaims.get(b.id) || 0;
+      if (have >= want) continue;
+      // A foundation nobody is on gets a crew - that much was always true, and
+      // it is what covers the whole crew being killed.
+      //
+      // A Castle is also topped *back up* to its full crew, which is the case
+      // that was silently broken: the old rule skipped any foundation with a
+      // single claim on it, so a Castle whose crew of four was cut down to one
+      // by the very raid it was being built to answer kept that one villager
+      // for the rest of the game. Measured over six games, that is a median
+      // Castle taking 471 seconds to go up instead of 40.
+      //
+      // Everything else is left alone once anyone is on it. A second walk is
+      // not worth shaving a few seconds off a House, and topping up Town Center
+      // foundations every pass quietly pulled gatherers off the map all game.
+      if (have > 0 && b.type !== 'castle') continue;
+      const builders = this.pickBuilders(b.x, b.y, want - have);
       if (builders.length) g.commandBuildAt(builders, b);
     }
   }
@@ -1001,8 +1184,31 @@ export class AI {
     if (this.glut > GLUT) {
       const over = Math.min(1, (this.glut - GLUT) / GLUT);
       target = Math.round(target * (1 - 0.15 - 0.35 * over));
+
+      // A glut that will not go away is a different statement from a glut. One
+      // flat cut answers "the bank is ahead of the town"; it does not answer
+      // "the town has been at its limit with every pile enormous for ten
+      // minutes", which means the extra income has nowhere to go at all and
+      // every villager still earning it is a soldier that is not on the field.
+      // Eased in over ten minutes so the economy drifts down rather than being
+      // dismantled - if anything changes, the timer resets and it grows back.
+      if (this.glutElapsed > AI.GLUT_PATIENCE) {
+        const soak = Math.min(1, (this.glutElapsed - AI.GLUT_PATIENCE) / 600);
+        target = Math.round(target * (1 - 0.3 * soak));
+      }
+
       // Still enough of an economy to replace losses and hold the ages.
-      target = Math.max(this.ageGate(), Math.round(ceiling * 0.35), target);
+      //
+      // The age gate is "enough villagers to reach the next age", and in the
+      // Imperial Age there is no next age - `ageGate` says so by returning
+      // Infinity. Unguarded, that Infinity *was* the answer: the target came
+      // back infinite for the whole Imperial Age, so the cut above was computed
+      // and then thrown away, and none of this had ever run in the age it was
+      // written for. Traced 100-minute games sat at 500 of 500 population with a
+      // hundred and sixty thousand resources banked and never trimmed a soul.
+      const gate = this.ageGate();
+      target = Math.max(Number.isFinite(gate) ? gate : 0,
+        Math.round(ceiling * 0.35), target);
     }
     return target;
   }
@@ -1039,12 +1245,42 @@ export class AI {
       const floor = this.ageSaveFloor();
       const exempt = this.ageSaveElapsed() < AI.AGE_SAVE_GRACE;
       const depth = 2 + Math.round(this.pri('boom') * 2);
-      for (let i = 0; i < tcs.length; i++) {
-        const free = i === 0 && exempt;
-        if (!free && this.p.res.food - (cost.food || 0) < floor) break;
+      // Breadth first: whichever Town Center has the shortest queue gets the
+      // next villager, so four of them hold one each rather than the first
+      // holding four.
+      //
+      // The old loop walked the list in order and stopped at the first villager
+      // it could not afford, which is a fair description of most of the game -
+      // so the Town Centers at the front of the list were fed every pass and
+      // the ones at the back were never reached at all. Measured over six games
+      // the deepest queue sat 2.6 villagers above the shallowest, and 85% of
+      // the time one Town Center was empty while another held two or more. The
+      // AI was paying 275 wood and 100 stone for buildings that then stood
+      // idle, and the queue they were meant to relieve never got any shorter.
+      //
+      // Two things about this loop are deliberate, and both cost about a tenth
+      // of the economy when I got them wrong. It still queues at most one
+      // villager per Town Center per pass - running on until every queue was
+      // `depth` deep committed several passes' worth of food in one go. And the
+      // main Town Center keeps its priority whenever the age-save floor is
+      // biting: it is the one exempt from that floor, so picking a different
+      // Town Center first meant hitting the floor and abandoning the pass with
+      // nothing queued at all, on exactly the Town Center that was allowed to
+      // keep booming. The fix here is the order, not the rate or the rules.
+      const main = tcs[0];
+      const queued = new Map(tcs.map((b) =>
+        [b, b.queue.filter((q) => q.kind === 'unit').length]));
+      for (let n = tcs.length; n > 0; n--) {
         if (!this.canSpend(cost, true)) break;
-        const queued = tcs[i].queue.filter((q) => q.kind === 'unit').length;
-        if (queued < depth) this.game.queueUnit(tcs[i], 'villager');
+        const floorOk = this.p.res.food - (cost.food || 0) >= floor;
+        let pick = null;
+        for (const b of tcs) {
+          if (queued.get(b) >= depth) continue;
+          if (!floorOk && !(b === main && exempt)) continue;
+          if (!pick || queued.get(b) < queued.get(pick)) pick = b;
+        }
+        if (!pick || !this.game.queueUnit(pick, 'villager')) break;
+        queued.set(pick, queued.get(pick) + 1);
       }
     }
     this.cullSurplusVillagers(target);
@@ -1063,16 +1299,23 @@ export class AI {
    * cascade into the AI finishing them off.
    */
   cullSurplusVillagers(target) {
-    if (this.glut <= GLUT) return;
-    if (this.p.pop < this.p.effectivePopCap - 2) return;
-    if (this.p.effectivePopCap < this.p.popMax - this.share(0.025, 5)) return;
+    // The glut and the cap both have to have held for a while - see trackStocks.
+    if (this.glutElapsed <= AI.GLUT_PATIENCE) return;
     const surplus = this.mine.villagers.length - target;
     if (surplus <= 0) return;
-    // Take them off whatever we have most of, and never mid-carry or garrisoned.
-    const worst = RESOURCES.reduce((a, b) => (this.stockAvg[a] >= this.stockAvg[b] ? a : b));
+    // Take them off the piles we have most of, in order, and never mid-carry or
+    // garrisoned. Ranking by the pile each villager is actually working - rather
+    // than only matching the single largest one - is what makes this thin the
+    // *top* resources: with wood and gold both enormous it comes off both, and
+    // the crew on whatever the town is short of is the last to be touched.
+    const rank = (v) => {
+      const res = v.task && (v.task.type === 'gather' || v.task.type === 'deliver')
+        ? v.task.resType : null;
+      return res && this.stockAvg[res] !== undefined ? this.stockAvg[res] : -1;
+    };
     const pool = this.mine.villagers
       .filter((v) => !v.garrisonedIn && !(v.carrying && v.carrying.amount > 0))
-      .sort((a, b) => (b.task.resType === worst ? 1 : 0) - (a.task.resType === worst ? 1 : 0));
+      .sort((a, b) => rank(b) - rank(a));
     for (let i = 0; i < Math.min(2, surplus, pool.length); i++) this.game.kill(pool[i], null);
   }
 
@@ -1109,29 +1352,59 @@ export class AI {
     if (this.mine.villagers.length < 8) return;
     const over = ['food', 'wood', 'gold', 'stone'].sort((a, b) => deficit(a) - deficit(b))[0];
     const under = ['food', 'wood', 'gold', 'stone'].sort((a, b) => deficit(b) - deficit(a))[0];
-    if (over === under || deficit(under) - deficit(over) < 0.18) return;
-    // One villager per pass, normally. Re-tasking costs a walk, so a twitchy
-    // rebalance burns more gathering time than the misallocation it corrects -
-    // and a fast one actively breaks things: a crew sent to a distant woodline
-    // was being pulled straight back off it, several at a time, before the AI
-    // could notice the long haul and plant the Lumber Camp that fixes it.
+    // Is the bank *actually* lopsided, or is the split merely a few points from
+    // where the network would like it?
     //
-    // The exception is the emergency Castle, which is a discrete deadline
-    // rather than a preference: 650 stone at one villager per second takes
-    // three minutes just to assign the crew, and the Castle is needed sooner
-    // than that.
-    // One a pass normally. More when the bank is genuinely lopsided, because
-    // then the misallocation is not drift - it is a crew standing on the wrong
-    // resource while another runs dry, and correcting that one villager a
-    // second takes minutes.
-    const budget = (this.wantEmergencyCastle && under === 'stone') ? 4
-      : (this.stockImbalance || 0) > 0.6 ? 3 : 1;
+    // This is the distinction the whole rebalance turns on. Re-tasking costs a
+    // walk, and measured over seven games, chasing every small drift in the
+    // requested split cost about a twentieth of the economy and a sixth of the
+    // army: the AI spent the game correcting misallocations that were never
+    // costing it anything. So the ordinary case keeps the old deliberately slow
+    // behaviour - one villager a pass, and only once the split is well out.
+    //
+    // A bank that has actually gone lopsided is a different situation, and it is
+    // the one that was never being corrected at all: four crews of seventy
+    // sitting a few points either side of a quarter each, beside ninety thousand
+    // gold and a thousand food. That is only ever twelve points from the
+    // requested split, so the flat threshold meant *nothing moved for the whole
+    // game* - and one villager a second could not have fixed a three-hundred
+    // villager town in the time left even if it had.
+    const lopsided = (this.stockSpread || 0) > 4000 && (this.stockImbalance || 0) > 0.6;
+    const gap = deficit(under) - deficit(over);
+    if (over === under || gap < (lopsided ? 0.05 : 0.18)) return;
+    // The corrective rate has to be a share of the town rather than a count, for
+    // the same reason: one villager a pass corrects a ten-villager economy in
+    // seconds and a three-hundred villager one never. Half the measured gap is
+    // what to move - moving all of it overshoots and oscillates, because the gap
+    // is re-read next pass against a split that has itself moved - and the cap
+    // keeps a single pass from picking up a whole woodline and walking it across
+    // the map.
+    //
+    // The exception is the emergency Castle, which is a discrete deadline rather
+    // than a preference: 650 stone at one villager per second takes three
+    // minutes just to assign the crew, and the Castle is needed sooner than that.
+    let budget = (this.stockImbalance || 0) > 0.6 ? 3 : 1;
+    if (lopsided) {
+      budget = Math.max(budget,
+        Math.min(Math.floor(gap * total * 0.5), Math.ceil(total * 0.03)));
+    }
+    if (this.wantEmergencyCastle && under === 'stone') budget = Math.max(budget, 4);
+    //
+    // Whatever the rate, a villager that has just been re-tasked is off the
+    // table until it has had long enough to be worth the walk. The damage a fast
+    // rebalance does is not the number of villagers moved in a pass - it is the
+    // same villagers being moved over and over: the split is re-read every
+    // second against a town that has itself just moved, so `over` and `under`
+    // swap places and a crew spends its life walking between a woodline and a
+    // gold mine without ever mining either.
+    const now = this.game.time;
     let moved = 0;
     for (const v of this.mine.villagers) {
       if (moved >= budget) break;
       if (v.task.type !== 'gather' || v.task.resType !== over) continue;
       if (v.carrying && v.carrying.amount > 0) continue;   // let it finish the trip
-      if (this.assignGather(v, under)) moved++;
+      if (now - (v._aiRetask || -Infinity) < AI.RETASK_COOLDOWN) continue;
+      if (this.assignGather(v, under)) { v._aiRetask = now; moved++; }
     }
     this.recallTrespassers();
   }
@@ -1221,6 +1494,15 @@ export class AI {
       }
     }
 
+    // Same argument for an upgrade fund, more weakly: Paladin's 1300 food is an
+    // age-sized lump, and a town gathering it out of a split that ignores it
+    // takes long enough that the fund times out before it ever fills.
+    if (this.savingForUpgrade && this.reserve) {
+      for (const k in this.reserve) {
+        if (this.reserve[k] > 0 && this.p.res[k] < this.reserve[k]) split[k] *= 1.4;
+      }
+    }
+
     // Persistently short of one thing while drowning in another: move effort
     // off the pile and onto the shortage.
     //
@@ -1231,24 +1513,46 @@ export class AI {
     // into five figures. This compares the *averages*, so it answers "we are
     // always short of food" rather than "a Town Center just took 50".
     //
-    // Deliberately a comparison between the extremes rather than a threshold on
+    // Deliberately a comparison against the extremes rather than a threshold on
     // each. An earlier attempt boosted whatever was individually low and became
     // an equalising attractor: it held all four piles level, never accumulated
     // the 1000-food lump the Imperial Age costs, and cost the AI half its
-    // economy. Moving from the biggest pile to the smallest cannot do that,
-    // because it stops as soon as they are comparable.
+    // economy. Moving from the biggest piles to the smallest cannot do that,
+    // because it stops as soon as they are comparable - the 2:1 gate below means
+    // nothing happens at all until they are a factor of two apart.
+    //
+    // Every pile is scored against the biggest one, rather than only the single
+    // lowest against the single highest. Two enormous piles and two starved ones
+    // is the ordinary shape of a late-game economy - ninety thousand wood *and*
+    // ninety thousand gold beside a thousand food - and the pairwise version
+    // could only ever correct one of each: gold kept its full crew for the rest
+    // of the game because wood happened to be a few hundred higher.
     if (this.stockAvg) {
       const usable = RESOURCES.filter((k) => split[k] > 0.03);
-      const low = usable.reduce((a, b) => (this.stockAvg[a] <= this.stockAvg[b] ? a : b), usable[0]);
-      const high = usable.reduce((a, b) => (this.stockAvg[a] >= this.stockAvg[b] ? a : b), usable[0]);
-      // Never rob a pile the age is being saved out of.
-      const banking = this.savingForAge && this.reserve &&
-        (this.reserve[high] || 0) > this.p.res[high];
-      if (low && high && low !== high && !banking &&
-          this.stockAvg[low] < this.stockAvg[high] * 0.5) {
-        const gap = 1 - this.stockAvg[low] / Math.max(1, this.stockAvg[high]);
-        split[low] *= 1 + gap * 1.5;
-        split[high] *= 1 - gap * 0.5;
+      let hi = 0, lo = Infinity;
+      for (const k of usable) {
+        hi = Math.max(hi, this.stockAvg[k]);
+        lo = Math.min(lo, this.stockAvg[k]);
+      }
+      if (hi > 0 && lo < hi * 0.5) {
+        const spread = 1 - lo / hi;
+        for (const k of usable) {
+          // 0 for the biggest pile, approaching 1 for an empty one.
+          const gap = 1 - this.stockAvg[k] / hi;
+          // Never rob a pile the age is being saved out of.
+          const banking = this.savingForAge && this.reserve &&
+            (this.reserve[k] || 0) > this.p.res[k];
+          // The two ends keep exactly the strength the pairwise version had -
+          // a pile at the top is cut by up to half, an empty one boosted by up
+          // to two and a half. What is new is only that *several* piles can be
+          // at either end at once. The middle is deliberately left alone: an
+          // earlier attempt cut everything that was not the lowest, which is an
+          // equalising attractor wearing a disguise, and it cost a tenth of the
+          // economy - the AI kept taking villagers off food, which is the top
+          // pile most of the time and is also what buys the next age.
+          if (gap >= 0.5) split[k] *= 1 + (gap - 0.5) * 3;
+          else if (gap <= 0.25 && !banking) split[k] *= 1 - spread * 0.5 * (1 - gap / 0.25);
+        }
       }
     }
 
@@ -1286,6 +1590,8 @@ export class AI {
   static DANGER_SECONDS = 150;
   /** Danger score at which a villager refuses to work a spot at all. */
   static DANGER_REFUSE = 10;
+  /** How long a rebalanced villager is left alone before it may be moved again. */
+  static RETASK_COOLDOWN = 45;
 
   assignGather(v, res) {
     const g = this.game;
@@ -2216,6 +2522,13 @@ export class AI {
     const r = this.p.res;
     const rich = r.food > 700 && r.gold > 500;
     const deep = Math.max(2, Math.round((rich ? 7 : 3) * (0.6 + mil * 0.8)));
+    // Shortest wait first, for the same reason the Town Centers are filled that
+    // way: this loop queues at most one unit per building per pass and stops
+    // when the bank runs dry, so in list order the Barracks built first was
+    // stacked `deep` while the fourth Stable never trained anything. Sorting by
+    // how soon each building could actually start means an idle one is always
+    // preferred to a busy one, and a batch finishes as early as it can.
+    producers.sort((a, b) => g.queueWaitTime(a) - g.queueWaitTime(b));
     for (const b of producers) {
       if (b.queue.length >= deep) continue;
       const options = comp
@@ -2620,7 +2933,7 @@ export class AI {
     // list: siege flattening a Town Center outranks a scout in the woodline.
     const priority = threats.slice().sort((a, b) =>
       this.threatWeight(b) - this.threatWeight(a))[0];
-    if (defenders.length) g.commandAttack(defenders, priority);
+    this.sendDefenders(defenders, priority);
 
     // Villagers under fire garrison the Town Center.
     const scared = this.mine.villagers.filter((v) =>
@@ -2628,6 +2941,56 @@ export class AI {
     if (scared.length && this.tc && this.tc.garrison.length < this.tc.def.garrison) {
       g.commandGarrison(scared.slice(0, 8), this.tc);
     }
+  }
+
+  /**
+   * Sends the defence at a raid without turning it into a parade.
+   *
+   * Every defender used to be handed the single highest-weighted threat as an
+   * explicit attack order, re-issued every pass. Three things went wrong with
+   * that, and together they are most of what makes an AI army look silly:
+   *
+   * An explicit order is honoured to the letter, so a soldier standing next to
+   * an enemy would walk the length of the town to reach the one the AI had
+   * named, taking hits the whole way and never swinging back.
+   *
+   * Re-issuing it every second reset the path every second, so units spent the
+   * fight walking rather than fighting - and when the named threat died they
+   * were all handed the next one, wherever it happened to be, together.
+   *
+   * And pointing twenty units at one target wastes nineteen of them: the rest
+   * of the raiding party is left free to work.
+   *
+   * So: whoever can already reach the priority target focuses it - that part
+   * was right, and is what kills the siege before it kills the Town Center -
+   * and everyone else is sent to the fight as an attack-move, which engages
+   * whatever it meets on the way. Units already busy with a live enemy nearby
+   * are left alone entirely.
+   */
+  sendDefenders(defenders, priority) {
+    if (!defenders.length) return;
+    const g = this.game;
+    const focus = [];
+    const send = [];
+    for (const u of defenders) {
+      const reach = Math.max(u.def.los, (u.def.range || 0) + 2);
+      // Already fighting something that is right here: that is the job.
+      if (u.task.type === 'attack') {
+        const t = g.get(u.task.targetId);
+        if (t && t.alive && g._distTo(u, t) <= reach) continue;
+      }
+      // Already on its way to this fight. Re-issuing the order every pass is
+      // what kept the army walking instead of arriving: each one throws away
+      // the route and asks for another.
+      if (u.task.type === 'attackMove' &&
+          Math.hypot(u.task.x - priority.x, u.task.y - priority.y) < 6) continue;
+      if (g._distTo(u, priority) <= reach) focus.push(u);
+      else send.push(u);
+    }
+    if (focus.length) g.commandAttack(focus, priority);
+    // Nudged toward the threat rather than onto it, so the group does not pile
+    // onto one tile and shove itself apart.
+    if (send.length) g.commandAttackMove(send, priority.x, priority.y);
   }
 
   /** How badly a particular attacker needs killing first. */
@@ -2741,11 +3104,18 @@ export class AI {
       ? this.p.res.food / this.reserve.food : 0;
     tryList(this.unitUpgradeTechs(), popCapped ? limit : Math.max(1, Math.ceil(limit / 2)),
       !this.savingForAge || fundFull < 0.7);
-    tryList(TECH_PRIORITY, limit, popCapped);
+    // The population cap normally lets everything else ignore the reserve, on
+    // the grounds that a bank at the cap has nothing else to buy. It has one
+    // thing: an upgrade fund is *only* ever set at that point, and thirty
+    // Blacksmith techs draining it a hundred food at a time is exactly why the
+    // Paladin fund never filled. The fund still stands down on its own timer, so
+    // this delays the rest of the sweep rather than blocking it.
+    const sweep = popCapped && !this.savingForUpgrade;
+    tryList(TECH_PRIORITY, limit, sweep);
     // Everything else the civ has - unique techs, university and monastery work.
     // Only worth sweeping when the army cannot grow any further, which is
     // exactly when the bank would otherwise just sit there.
-    if (popCapped) tryList(this.remainingTechs(), limit, true);
+    if (popCapped) tryList(this.remainingTechs(), limit, sweep);
   }
 
   /**
@@ -2824,8 +3194,7 @@ export class AI {
   /** Lays a foundation on an already-chosen spot and staffs it. */
   commitBuild(bId, spot) {
     if (!spot) return false;
-    const crew = (bId === 'castle' || bId === 'townCenter') ? 4 : 2;
-    const builders = this.pickBuilders(spot.x, spot.y, crew);
+    const builders = this.pickBuilders(spot.x, spot.y, this.buildCrew(bId));
     if (!builders.length) return false;
     return !!this.game.commandBuild(builders, bId, spot.x, spot.y);
   }

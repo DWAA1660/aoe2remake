@@ -68,9 +68,13 @@ T('wheelbarrow', {
   name: 'Wheelbarrow', building: 'townCenter', age: 'feudal',
   cost: { food: 175, wood: 50 }, time: 75,
   desc: 'Villagers +10% speed, +25% carry capacity.',
+  // The original applies 26.95% internally, specifically so that rounding can
+  // never drop the delivered figure below the +25% the tooltip promises. Both
+  // this and Hand Cart stack against the base carry rather than against each
+  // other - see `carryPct`.
   effects: [
     { k: 'unitStat', sel: { ids: ['villager'] }, stat: 'speed', mult: 1.1 },
-    { k: 'carry', mult: 1.25 },
+    { k: 'carry', pct: 0.2695 },
   ],
 });
 T('handCart', {
@@ -79,7 +83,7 @@ T('handCart', {
   desc: 'Villagers +10% speed, +50% carry capacity.',
   effects: [
     { k: 'unitStat', sel: { ids: ['villager'] }, stat: 'speed', mult: 1.1 },
-    { k: 'carry', mult: 1.5 },
+    { k: 'carry', pct: 0.5 },
   ],
 });
 T('townWatch', {

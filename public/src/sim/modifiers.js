@@ -53,6 +53,13 @@ export class ModifierSet {
     this.gather = { food: 1, wood: 1, gold: 1, stone: 1, farm: 1, sheep: 1, berries: 1, hunt: 1, fish: 1 };
     this.carryAdd = 0;
     this.carryMult = 1;
+    /**
+     * Carry bonuses that stack against the *base* rather than against each
+     * other, which is how Wheelbarrow and Hand Cart work in the original.
+     * Multiplying them gave +87.5% where the game gives +77%, so a fully
+     * upgraded economy hauled about six percent more per trip than it should.
+     */
+    this.carryPct = 0;
     this.farmFoodAdd = 0;
     this.buildRateMult = 1;
     this.trainSpeedMult = 1;
@@ -102,6 +109,7 @@ export class ModifierSet {
       case 'carry':
         if (e.add) this.carryAdd += e.add;
         if (e.mult) this.carryMult *= e.mult;
+        if (e.pct) this.carryPct += e.pct;
         break;
       case 'farmFood': this.farmFoodAdd += e.add || 0; break;
       case 'buildRate': this.buildRateMult *= e.mult ?? 1; break;

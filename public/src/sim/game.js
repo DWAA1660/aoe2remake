@@ -4,7 +4,7 @@ import { RNG } from '../core/rng.js';
 import { SpatialGrid } from '../core/grid.js';
 import { generateMap, TERRAIN } from './map.js';
 import { Player, AGES, registerCivTable } from './player.js';
-import { makeUnit, makeBuilding, makeResource, makeProjectile, resetIds, RESOURCE_INFO } from './entity.js';
+import { makeUnit, makeBuilding, makeResource, makeCarcass, makeProjectile, resetIds, RESOURCE_INFO } from './entity.js';
 import { resolveDamage, areaDamage } from './combat.js';
 import { computeDamage } from '../data/armor.js';
 import { UNITS } from '../data/units.js';
@@ -29,6 +29,21 @@ const CARRY_BASE = 10;
 const DISTRESS_RADIUS = 26;
 /** How long after being hit something still counts as under attack. */
 const DISTRESS_SECONDS = 4;
+/**
+ * What a target already inside our weapon range is worth over one we would
+ * have to walk to. Large on purpose: it has to outweigh every role preference
+ * put together, because "hit the thing in front of you" beats all of them.
+ */
+const IN_RANGE_BONUS = 30;
+/**
+ * How much better a new target must score before a unit already fighting will
+ * turn to it. Swapping is not free - the swing in progress is wasted and the
+ * unit may have to walk - so a fight would otherwise be spent re-aiming as two
+ * candidates traded places a fraction of a point apart.
+ */
+const RETARGET_MARGIN = 34;
+/** How often a unit in combat reconsiders, in ticks (staggered across units). */
+const RETARGET_INTERVAL = 5;
 
 export class Game {
   constructor(config) {
@@ -146,7 +161,8 @@ export class Game {
 
   /** How much a player's villagers can carry before they must drop off. */
   carryCapacity(pl) {
-    return Math.round((CARRY_BASE + pl.mods.carryAdd) * pl.mods.carryMult);
+    return Math.round((CARRY_BASE + pl.mods.carryAdd) *
+      (pl.mods.carryMult + pl.mods.carryPct));
   }
 
   spawnUnit(unitId, owner, x, y) {
@@ -220,9 +236,7 @@ export class Game {
       if (killer && this.players[killer.owner]) this.players[killer.owner].stats.unitsKilled++;
       // huntable animals leave a food carcass
       if (e.def.huntable) {
-        const c = makeResource('carcass', e.x, e.y, e.def.food || 100);
-        c.variant = e.type === 'boar' ? 2 : e.type === 'deer' ? 1 : 0;
-        this.addEntity(c);
+        this.addEntity(makeCarcass(e.type, e.x, e.y, e.def.food || 100));
       }
       // ungarrison anything it was carrying
       this.effects.push({ type: 'death', x: e.x, y: e.y, t: 0, unit: e.type });
@@ -820,51 +834,74 @@ export class Game {
     return d;
   }
 
-  /**
-   * Picks what a unit should shoot at.
-   *
-   * The old rule was "nearest thing, units before buildings", which meant
-   * Battering Rams stopped to punch villagers for 2 damage while the Town
-   * Center stood there, and Knights traded with Halberdiers instead of running
-   * down the economy behind them. Scoring starts from the damage we would
-   * actually deal - which is the counter system already expressed in numbers -
-   * and then adds the role preferences a player would apply by hand.
-   */
+  /** Picks what a unit should shoot at. See `_targetScore` for the reasoning. */
   _findTarget(u, range) {
+    return this._bestTarget(u, range).e;
+  }
+
+  /** As `_findTarget`, but keeps the score, so a candidate can be compared
+   *  against a target the unit is already committed to. */
+  _bestTarget(u, range) {
     let best = null, bestScore = -Infinity;
-    const raider = u.def.cat === 'cavalry';
     this.entityGrid.forEachNear(u.x, u.y, range, (e) => {
       if (!e.alive || !this.isEnemy(u.owner, e.owner)) return;
       if (e.kind === 'resource' || e.kind === 'projectile') return;
       if (e.garrisonedIn) return;
       const d = this._distTo(u, e);
       if (d > range) return;
-
-      // Halberdier vs Knight is already 30 here and vs Champion 6; a Ram is 200+
-      // on a building and 2 on a villager. Capped so a Ram's huge building
-      // number cannot swamp every other consideration.
-      let score = Math.min(this._dmgAgainst(u, e), 50) - d * 2;
-
-      if (e.kind === 'building') {
-        // Anything that cannot meaningfully dent a building should walk past it.
-        if (this._dmgAgainst(u, e) < 12) score -= 60;
-        else if (e.def.cat === 'military' || e.type === 'townCenter') score += 12;
-      } else {
-        if (e.def.cat === 'siege') score += 14;      // fragile, and lethal if ignored
-        if (e.def.converts) score += 12;             // monks steal our units
-        // Raiders go through the economy; a battle line stays on the battle.
-        // Siege actively avoids villagers: it is slow, expensive and the only
-        // thing that can break the enemy army, so spending its reload on a
-        // peasant while the archer line shoots back is the worst trade it has.
-        if (e.def.cat === 'villager') {
-          score += raider ? 22 : u.def.cat === 'siege' ? -8 : 3;
-        }
-        // Melee should close on shooters rather than trade with the front rank.
-        if ((e.def.range || 0) > 2 && !(u.def.range > 2)) score += 6;
-      }
+      const score = this._targetScore(u, e, d);
       if (score > bestScore) { bestScore = score; best = e; }
     });
-    return best;
+    return { e: best, score: bestScore };
+  }
+
+  /**
+   * How much `u` wants to be hitting `e`, which is `d` away.
+   *
+   * The original rule was "nearest thing, units before buildings", which meant
+   * Battering Rams stopped to punch villagers for 2 damage while the Town
+   * Center stood there, and Knights traded with Halberdiers instead of running
+   * down the economy behind them. Scoring starts from the damage we would
+   * actually deal - which is the counter system already expressed in numbers -
+   * and then adds the role preferences a player would apply by hand.
+   */
+  _targetScore(u, e, d) {
+    // Halberdier vs Knight is already 30 here and vs Champion 6; a Ram is 200+
+    // on a building and 2 on a villager. Capped so a Ram's huge building
+    // number cannot swamp every other consideration.
+    let score = Math.min(this._dmgAgainst(u, e), 50) - d * 2;
+
+    if (e.kind === 'building') {
+      // Anything that cannot meaningfully dent a building should walk past it.
+      if (this._dmgAgainst(u, e) < 12) score -= 60;
+      else if (e.def.cat === 'military' || e.type === 'townCenter') score += 12;
+    } else {
+      if (e.def.cat === 'siege') score += 14;      // fragile, and lethal if ignored
+      if (e.def.converts) score += 12;             // monks steal our units
+      // Raiders go through the economy; a battle line stays on the battle.
+      // Siege actively avoids villagers: it is slow, expensive and the only
+      // thing that can break the enemy army, so spending its reload on a
+      // peasant while the archer line shoots back is the worst trade it has.
+      if (e.def.cat === 'villager') {
+        score += u.def.cat === 'cavalry' ? 22 : u.def.cat === 'siege' ? -8 : 3;
+      }
+      // Melee should close on shooters rather than trade with the front rank.
+      if ((e.def.range || 0) > 2 && !(u.def.range > 2)) score += 6;
+      // Finish what is nearly dead: a unit on its last few hit points stops
+      // being a threat the moment it dies, and every point of damage put into a
+      // healthy one instead is damage the enemy gets to keep using.
+      if (e.hp < e.def.hp * 0.35) score += 8;
+    }
+
+    // Something we can hit from where we stand beats anything we have to walk
+    // to. This is the difference between a fight and a chase, and without it a
+    // +14 siege bonus or a +22 villager bonus routinely out-argued the two
+    // points a tile that distance was worth: soldiers walked out of a melee,
+    // through the unit hitting them, to reach something they liked better.
+    // Measured, they spent a third of every engagement doing exactly that, and
+    // died to the escort while killing one unit at a time.
+    if (d <= (u.def.range || 1) + (e.radius || 0) + 0.5) score += IN_RANGE_BONUS;
+    return score;
   }
 
   _taskMove(u, dt) {
@@ -955,6 +992,8 @@ export class Game {
       u.task = { type: 'idle' };
       return;
     }
+    this._reconsiderTarget(u, target);
+
     // gaia animals being hunted: villagers use the gather task instead
     const range = u.def.range || 0;
     const minR = u.def.minRange || 0;
@@ -994,6 +1033,46 @@ export class Game {
     if (u.attackCd > 0) return;
     u.attackCd = u.def.reload;
     this._performAttack(u, target);
+  }
+
+  /**
+   * A unit already in a fight looks up every second or so and asks whether the
+   * thing it is walking to is still the thing worth hitting.
+   *
+   * Target selection used to happen exactly once, at acquisition, and never
+   * again. That is what produced the behaviour this exists to fix: a soldier
+   * picked something across the field, set off, was intercepted by the group
+   * escorting it, killed whichever of them happened to land the killing blow
+   * first, and - because the original order was still sitting in its task -
+   * turned straight back around and walked off again while the rest of the
+   * group hit it in the back. It killed one unit per trip, spent the rest of
+   * the fight walking, and the escort never had to break formation.
+   *
+   * Explicit orders are left alone. A target the player or the AI named on
+   * purpose is a decision, not an acquisition, and quietly overriding it is how
+   * a focus-fire command stops meaning anything.
+   */
+  _reconsiderTarget(u, current) {
+    if (!u.task.auto) return;
+    // A villager swinging back at a wolf is not choosing between targets.
+    if (u.def.cat === 'villager') return;
+    if (this.tickCount % RETARGET_INTERVAL !== u.id % RETARGET_INTERVAL) return;
+    // Stand Ground has its own rule about what it may swing at, and a unit
+    // backing off to minimum range is mid-manoeuvre.
+    if (u.stance === 'standGround' || u.stance === 'noAttack') return;
+
+    const range = Math.max(u.def.los, (u.def.range || 0) + 2);
+    const best = this._bestTarget(u, range);
+    if (!best.e || best.e === current) return;
+    // The incumbent is scored from where we stand now, so a target we have been
+    // walking toward loses its head start honestly rather than by fiat.
+    const held = this._targetScore(u, current, this._distTo(u, current));
+    if (best.score <= held + RETARGET_MARGIN) return;
+
+    u.task = { ...u.task, targetId: best.e.id };
+    u.path = null;
+    u.pathIdx = 0;
+    u.repathCd = 0;
   }
 
   _performAttack(u, target) {
@@ -1197,7 +1276,10 @@ export class Game {
     const pl = this.players[u.owner];
     const info = isFarm ? RESOURCE_INFO.farm : RESOURCE_INFO[res.type];
     const sub = res.sub || info.sub || info.res;
-    const rate = info.gatherRate * (pl.mods.gather[sub] ?? 1) * (pl.mods.gather[info.res] ?? 1);
+    // A node may carry its own rate - a sheep carcass is worked at the slower
+    // shepherding rate than a boar's, though both are "carcass".
+    const base = (!isFarm && res.gatherRate !== undefined) ? res.gatherRate : info.gatherRate;
+    const rate = base * (pl.mods.gather[sub] ?? 1) * (pl.mods.gather[info.res] ?? 1);
     const cap = this.carryCapacity(pl);
 
     if (!u.carrying || u.carrying.res !== info.res) u.carrying = { res: info.res, sub, amount: 0 };
